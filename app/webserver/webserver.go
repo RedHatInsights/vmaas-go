@@ -3,8 +3,10 @@ package webserver
 import (
 	"encoding/json"
 	"github.com/RedHatInsights/vmaas-go/app/cache"
+	"github.com/RedHatInsights/vmaas-go/app/utils"
 	"log"
 	"net/http"
+	"runtime"
 )
 
 // start server serving loaded data
@@ -36,6 +38,13 @@ func Run() {
 	http.HandleFunc("/SrcPkgId2PkgId", createHandler(cache.C.SrcPkgId2PkgId))
 	http.HandleFunc("/String", createHandler(cache.C.String))
 
+	http.HandleFunc("/gc", func(w http.ResponseWriter, r *http.Request) {
+		runtime.GC()
+		w.WriteHeader(http.StatusOK)
+		utils.PrintMemUsage()
+		return
+	})
+
     err := http.ListenAndServe(":8080", nil)
     if err != nil {
     	print(err)
@@ -58,6 +67,7 @@ func createHandler(value interface{}) func(w http.ResponseWriter, r *http.Reques
 			return
 		}
 		w.WriteHeader(http.StatusOK)
+		utils.PrintMemUsage()
 		return
 	}
 }

@@ -1,10 +1,10 @@
 package main
 
 import (
-	"fmt"
 	"github.com/RedHatInsights/vmaas-go/app/cache"
 	"github.com/RedHatInsights/vmaas-go/app/config"
 	"github.com/RedHatInsights/vmaas-go/app/database"
+	"github.com/RedHatInsights/vmaas-go/app/utils"
 	"github.com/RedHatInsights/vmaas-go/app/webserver"
 	"log"
 	"os"
@@ -28,18 +28,6 @@ func main() {
 		log.Fatal("could not write memory profile: ", err)
 	}
 
-	PrintMemUsage()
+	utils.PrintMemUsage()
 	webserver.Run()
-}
-
-func PrintMemUsage() {
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	fmt.Printf("\nAlloc = %v MiB", bToMb(m.Alloc))
-	fmt.Printf("\nTotalAlloc = %v MiB", bToMb(m.TotalAlloc))
-	fmt.Printf("\nSys = %v MiB", bToMb(m.Sys))
-}
-
-func bToMb(b uint64) uint64 {
-	return b / 1024 / 1024
 }
