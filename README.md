@@ -11,6 +11,12 @@ Load dump and start simple server.
 ~~~bash
 ./vmaas-go ./path/too/vmaas-dump.db
 ~~~
+Run with restrictive garbage collection for low memory requirements.
+See [Golang runtime docs](https://golang.org/pkg/runtime/#hdr-Environment_Variables)
+for details.
+~~~
+GOGC=5 ./vmaas-go ./data/vmaas.db
+~~~
 
 Inspect data via web interface.
 ~~~bash
