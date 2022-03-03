@@ -11,6 +11,16 @@ services:
     env_file:
       - ./conf/database.env
 
+  redis:
+    container_name: redis
+    image: redis:6.2-alpine
+    restart: unless-stopped
+    command: /bin/sh -c "redis-server --requirepass $$REDIS_PASSWORD"
+    environment:
+      REDIS_PASSWORD: redis_pwd
+    ports:
+      - 6379:6379
+
   platform:
     container_name: platform
     build:
@@ -36,6 +46,7 @@ services:
     depends_on:
       - db
       - platform
+      - redis
     user: root
     command: ./scripts/go_test_on_ci.sh
     volumes:
