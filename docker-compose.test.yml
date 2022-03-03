@@ -1,0 +1,44 @@
+version: '3.4'
+services:
+  db:
+    container_name: db
+    build:
+      context: .
+      dockerfile: dev/database/Dockerfile
+    command: 'postgres -c config_file=/opt/app-root/src/postgresql-cfg/custom.conf'
+    ports:
+      - 5433:5432
+    env_file:
+      - ./conf/database.env
+
+  platform:
+    container_name: platform
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        - INSTALL_TOOLS=yes
+      target: buildimg
+    image: patchman-engine_patchimg
+    command: ./scripts/entrypoint.sh platform
+    restart: unless-stopped
+    ports:
+      - 9001:9001
+
+  test:
+    container_name: test
+    image: patchman-engine_patchimg
+    env_file:
+      - ./conf/test.env
+      - ./conf/database.env
+      - ./conf/database_admin.env
+      - ./conf/gorun.env
+    depends_on:
+      - db
+      - platform
+    user: root
+    command: ./scripts/go_test_on_ci.sh
+    volumes:
+      - ./:/go/src/app/
+    security_opt:
+      - label=disable
