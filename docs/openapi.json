@@ -1,0 +1,72 @@
+{
+    "openapi": "3.0.1",
+    "info": {
+        "title": "Patchman-engine API",
+        "description": "API of the Patch application on [console.redhat.com](https://console.redhat.com)\n\nSyntax of the `filter[name]` query parameters is described in  [Filters documentation](https://github.com/RedHatInsights/patchman-engine/wiki/API-custom-filters)",
+        "contact": {},
+        "license": {
+            "name": "GPLv3",
+            "url": "https://www.gnu.org/licenses/gpl-3.0.en.html"
+        },
+        "version": "v1.18.48"
+    },
+    "servers": [
+        {
+            "url": "/"
+        }
+    ],
+    "paths": {
+        "/api/patch/v1/updates": {
+            "post": {
+                "summary": "Show updates",
+                "description": "Show updates",
+                "operationId": "listAdvisories",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/controllers.UpdatesResponse"
+                                }
+                            }
+                        }
+                    }
+                },
+                "security": [
+                    {
+                        "RhIdentity": []
+                    }
+                ]
+            }
+        }
+    },
+    "components": {
+        "schemas": {
+            "controllers.UpdatesResponse": {
+                "type": "object",
+                "properties": {
+                    "update_list": {
+                        "type": "object",
+                        "additionalProperties": {
+                            "type": "array",
+                            "items": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "securitySchemes": {
+            "RhIdentity": {
+                "type": "apiKey",
+                "name": "x-rh-identity",
+                "in": "header"
+            }
+        }
+    }
+}
