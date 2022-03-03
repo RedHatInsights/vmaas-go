@@ -1,1058 +1,1265 @@
-CREATE TABLE IF NOT EXISTS schema_migrations
-(
-    version bigint  NOT NULL,
-    dirty   boolean NOT NULL,
-    PRIMARY KEY (version)
-) TABLESPACE pg_default;
+-- -----------------------------------------------------
+-- Vulnerability Metadata as a Service database
+--
+-- When making changes into this file, you need to increment
+-- the version number in db_version table and create update
+-- script in the upgrade folder.
+-- -----------------------------------------------------
 
+-- -----------------------------------------------------
+-- Table db_version
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS db_version (
+  name TEXT NOT NULL,
+  version INT NOT NULL,
+  PRIMARY KEY (name)
+)TABLESPACE pg_default;
 
-INSERT INTO schema_migrations
-VALUES (74, false);
+-- Increment this when editing this file
+INSERT INTO db_version (name, version) VALUES ('schema_version', 15);
 
--- ---------------------------------------------------------------------------
--- Functions
--- ---------------------------------------------------------------------------
+-- -----------------------------------------------------
+-- evr type
+-- represents version and release as arrays of parsed components
+-- of proper type (numeric or varchar)
+-- this allow us to use standard array operation for = > <
+-- and most importantly sorting
+-- -----------------------------------------------------
+create type evr_array_item as (
+        n       NUMERIC,
+        s       TEXT
+);
 
--- empty
-CREATE OR REPLACE FUNCTION empty(t TEXT)
-    RETURNS BOOLEAN as
-$empty$
+create type evr_t as (
+        epoch INT,
+        version evr_array_item[],
+        release evr_array_item[]
+);
+
+create or replace FUNCTION empty(t TEXT)
+RETURNS BOOLEAN as $$
 BEGIN
-    RETURN t ~ '^[[:space:]]*$';
+    return t ~ '^[[:space:]]*$';
 END;
-$empty$ LANGUAGE 'plpgsql';
+$$ language 'plpgsql';
 
-CREATE OR REPLACE FUNCTION ternary(cond BOOL, iftrue ANYELEMENT, iffalse ANYELEMENT)
-    RETURNS ANYELEMENT
-AS
-$$
-SELECT CASE WHEN cond = TRUE THEN iftrue else iffalse END;
-$$ LANGUAGE SQL IMMUTABLE;
-
--- set_first_reported
-CREATE OR REPLACE FUNCTION set_first_reported()
-    RETURNS TRIGGER AS
-$set_first_reported$
+create or replace FUNCTION errata_changed()
+RETURNS TRIGGER as $$
 BEGIN
-    IF NEW.first_reported IS NULL THEN
-        NEW.first_reported := CURRENT_TIMESTAMP;
-    END IF;
-    RETURN NEW;
+    update dbchange set errata_changes = CURRENT_TIMESTAMP;
+    return NULL;
 END;
-$set_first_reported$
-    LANGUAGE 'plpgsql';
+$$ language 'plpgsql';
 
--- set_last_updated
-CREATE OR REPLACE FUNCTION set_last_updated()
-    RETURNS TRIGGER AS
+create or replace FUNCTION repos_changed()
+RETURNS TRIGGER as $$
+BEGIN
+    update dbchange set repository_changes = CURRENT_TIMESTAMP;
+    return NULL;
+END;
+$$ language 'plpgsql';
+
+create or replace FUNCTION cpes_changed()
+RETURNS TRIGGER as $$
+BEGIN
+    update dbchange set cpe_changes = CURRENT_TIMESTAMP;
+    return NULL;
+END;
+$$ language 'plpgsql';
+
+create or replace FUNCTION cves_changed()
+RETURNS TRIGGER as $$
+BEGIN
+    update dbchange set cve_changes = CURRENT_TIMESTAMP;
+    return NULL;
+END;
+$$ language 'plpgsql';
+
+create or replace FUNCTION last_change()
+RETURNS TRIGGER as $$
+BEGIN
+    update dbchange set last_change = CURRENT_TIMESTAMP;
+    return NULL;
+END;
+$$ language 'plpgsql';
+
+create or replace FUNCTION set_last_updated()
+  RETURNS TRIGGER AS
 $set_last_updated$
-BEGIN
+  BEGIN
     IF (TG_OP = 'UPDATE') OR
        NEW.last_updated IS NULL THEN
-        NEW.last_updated := CURRENT_TIMESTAMP;
+      NEW.last_updated := CURRENT_TIMESTAMP;
     END IF;
     RETURN NEW;
-END;
+  END;
 $set_last_updated$
-    LANGUAGE 'plpgsql';
-
--- check_unchanged
-CREATE OR REPLACE FUNCTION check_unchanged()
-    RETURNS TRIGGER AS
-$check_unchanged$
-BEGIN
-    IF (TG_OP = 'INSERT') AND
-       NEW.unchanged_since IS NULL THEN
-        NEW.unchanged_since := CURRENT_TIMESTAMP;
-    END IF;
-    IF (TG_OP = 'UPDATE') AND
-       NEW.json_checksum <> OLD.json_checksum THEN
-        NEW.unchanged_since := CURRENT_TIMESTAMP;
-    END IF;
-    RETURN NEW;
-END;
-$check_unchanged$
-    LANGUAGE 'plpgsql';
+  LANGUAGE 'plpgsql';
 
 
-CREATE OR REPLACE FUNCTION on_system_update()
-    RETURNS TRIGGER
-AS
-$system_update$
-DECLARE
-    was_counted  BOOLEAN;
-    should_count BOOLEAN;
-    change       INT;
-BEGIN
-    -- Ignore not yet evaluated systems
-    IF TG_OP != 'UPDATE' OR NEW.last_evaluation IS NULL THEN
-        RETURN NEW;
-    END IF;
-
-    was_counted := OLD.stale = FALSE;
-    should_count := NEW.stale = FALSE;
-
-    -- Determine what change we are performing
-    IF was_counted and NOT should_count THEN
-        change := -1;
-    ELSIF NOT was_counted AND should_count THEN
-        change := 1;
-    ELSE
-        -- No change
-        RETURN NEW;
-    END IF;
-
-    -- Select all changed rows, lock them
-    WITH to_update_advisories AS (
-        SELECT aad.advisory_id,
-               aad.rh_account_id,
-               -- Desired count depends on old count + change
-               aad.systems_affected + change                                                    as systems_affected_dst,
-               -- Divergent count is the same, only depends on advisory_account_data status being different
-               aad.systems_status_divergent + ternary(aad.status_id != sa.status_id, change, 0) as divergent
-        FROM advisory_account_data aad
-                 INNER JOIN system_advisories sa ON aad.advisory_id = sa.advisory_id
-             -- Filter advisory_account_data only for advisories affectign this system & belonging to system account
-        WHERE aad.rh_account_id = NEW.rh_account_id
-          AND sa.system_id = NEW.id AND sa.rh_account_id = NEW.rh_account_id
-          AND sa.when_patched IS NULL
-        ORDER BY aad.advisory_id FOR UPDATE OF aad),
-         -- Where count > 0, update existing rows
-         update AS (
-             UPDATE advisory_account_data aad
-                 SET systems_affected = ta.systems_affected_dst,
-                     systems_status_divergent = ta.divergent
-                 FROM to_update_advisories ta
-                 WHERE aad.advisory_id = ta.advisory_id
-                     AND aad.rh_account_id = NEW.rh_account_id
-                     AND ta.systems_affected_dst > 0
-         ),
-         -- Where count = 0, delete existing rows
-         delete AS (
-             DELETE
-                 FROM advisory_account_data aad
-                     USING to_update_advisories ta
-                     WHERE aad.rh_account_id = ta.rh_account_id
-                         AND aad.advisory_id = ta.advisory_id
-                         AND ta.systems_affected_dst <= 0
-         )
-         -- If we have system affected && no exisiting advisory_account_data entry, we insert new rows
-    INSERT
-    INTO advisory_account_data (advisory_id, rh_account_id, systems_affected)
-    SELECT sa.advisory_id, NEW.rh_account_id, 1
-    FROM system_advisories sa
-    WHERE sa.system_id = NEW.id AND sa.rh_account_id = NEW.rh_account_id
-      AND sa.when_patched IS NULL
-      AND change > 0
-      -- We system_advisory pairs which don't already have rows in to_update_advisories
-      AND (NEW.rh_account_id, sa.advisory_id) NOT IN (
-        SELECT ta.rh_account_id, ta.advisory_id
-        FROM to_update_advisories ta
-    )
-    ON CONFLICT (advisory_id, rh_account_id) DO UPDATE SET systems_affected = advisory_account_data.systems_affected + EXCLUDED.systems_affected;
-    RETURN NEW;
-END;
-$system_update$ LANGUAGE plpgsql;
-
--- count system advisories according to advisory type
-CREATE OR REPLACE FUNCTION system_advisories_count(system_id_in INT, advisory_type_id_in INT DEFAULT NULL)
-    RETURNS INT AS
-$system_advisories_count$
-DECLARE
-    result_cnt INT;
-BEGIN
-    SELECT COUNT(advisory_id)
-    FROM system_advisories sa
-             JOIN advisory_metadata am ON sa.advisory_id = am.id
-    WHERE (am.advisory_type_id = advisory_type_id_in OR advisory_type_id_in IS NULL)
-      AND sa.system_id = system_id_in
-      AND sa.when_patched IS NULL
-    INTO result_cnt;
-    RETURN result_cnt;
-END;
-$system_advisories_count$ LANGUAGE 'plpgsql';
-
-CREATE OR REPLACE FUNCTION refresh_advisory_caches_multi(advisory_ids_in INTEGER[] DEFAULT NULL,
-                                                         rh_account_id_in INTEGER DEFAULT NULL)
-    RETURNS VOID AS
-$refresh_advisory$
-BEGIN
-    -- Lock rows
-    PERFORM aad.rh_account_id, aad.advisory_id
-    FROM advisory_account_data aad
-    WHERE (aad.advisory_id = ANY (advisory_ids_in) OR advisory_ids_in IS NULL)
-      AND (aad.rh_account_id = rh_account_id_in OR rh_account_id_in IS NULL)
-        FOR UPDATE OF aad;
-
-    WITH current_counts AS (
-        SELECT sa.advisory_id, sp.rh_account_id, count(sa.system_id) as systems_affected
-        FROM system_advisories sa
-        INNER JOIN system_platform sp
-           ON sa.rh_account_id = sp.rh_account_id AND sa.system_id = sp.id
-        WHERE sp.last_evaluation IS NOT NULL
-          AND sp.stale = FALSE
-          AND sa.when_patched IS NULL
-          AND (sa.advisory_id = ANY (advisory_ids_in) OR advisory_ids_in IS NULL)
-          AND (sp.rh_account_id = rh_account_id_in OR rh_account_id_in IS NULL)
-        GROUP BY sa.advisory_id, sp.rh_account_id
-    ),
-         upserted AS (
-             INSERT INTO advisory_account_data (advisory_id, rh_account_id, systems_affected)
-                 SELECT advisory_id, rh_account_id, systems_affected
-                 FROM current_counts
-                 ON CONFLICT (advisory_id, rh_account_id) DO UPDATE SET
-                     systems_affected = EXCLUDED.systems_affected
-         )
-    DELETE
-    FROM advisory_account_data
-    WHERE (advisory_id, rh_account_id) NOT IN (SELECT advisory_id, rh_account_id FROM current_counts)
-      AND (advisory_id = ANY (advisory_ids_in) OR advisory_ids_in IS NULL)
-      AND (rh_account_id = rh_account_id_in OR rh_account_id_in IS NULL);
-END;
-$refresh_advisory$ language plpgsql;
-
-CREATE OR REPLACE FUNCTION refresh_advisory_caches(advisory_id_in INTEGER DEFAULT NULL,
-                                                   rh_account_id_in INTEGER DEFAULT NULL)
-    RETURNS VOID AS
-$refresh_advisory$
-BEGIN
-    IF advisory_id_in IS NOT NULL THEN
-        PERFORM refresh_advisory_caches_multi(ARRAY [advisory_id_in], rh_account_id_in);
-    ELSE
-        PERFORM refresh_advisory_caches_multi(NULL, rh_account_id_in);
-    END IF;
-END;
-$refresh_advisory$ language plpgsql;
-
-CREATE OR REPLACE FUNCTION refresh_system_caches(system_id_in INTEGER DEFAULT NULL,
-                                                 rh_account_id_in INTEGER DEFAULT NULL)
-    RETURNS INTEGER AS
-$refresh_system$
-DECLARE
-    COUNT INTEGER;
-BEGIN
-    WITH to_update AS (
-        SELECT sp.rh_account_id, sp.id
-        FROM system_platform sp
-        WHERE (sp.id = system_id_in OR system_id_in IS NULL)
-          AND (sp.rh_account_id = rh_account_id_in OR rh_account_id_in IS NULL)
-        ORDER BY sp.rh_account_id, sp.id
-            FOR UPDATE OF sp
-        )
-        UPDATE system_platform sp
-           SET advisory_count_cache = system_advisories_count(sp.id, NULL),
-               advisory_enh_count_cache = system_advisories_count(sp.id, 1),
-               advisory_bug_count_cache = system_advisories_count(sp.id, 2),
-               advisory_sec_count_cache = system_advisories_count(sp.id, 3)
-          FROM to_update to_up
-         WHERE sp.rh_account_id = to_up.rh_account_id AND sp.id = to_up.id;
-    GET DIAGNOSTICS COUNT = ROW_COUNT;
-    RETURN COUNT;
-END;
-$refresh_system$ LANGUAGE plpgsql;
-
--- update system advisories counts (all and according types)
-CREATE OR REPLACE FUNCTION update_system_caches(system_id_in INT)
-    RETURNS VOID AS
-$update_system_caches$
-BEGIN
-    PERFORM refresh_system_caches(system_id_in, NULL);
-END;
-$update_system_caches$
-    LANGUAGE 'plpgsql';
-
--- refresh_all_cached_counts
--- WARNING: executing this procedure takes long time,
---          use only when necessary, e.g. during upgrade to populate initial caches
-CREATE OR REPLACE FUNCTION refresh_all_cached_counts()
-    RETURNS void AS
-$refresh_all_cached_counts$
-BEGIN
-    PERFORM refresh_system_caches(NULL, NULL);
-    PERFORM refresh_advisory_caches(NULL, NULL);
-END;
-$refresh_all_cached_counts$
-    LANGUAGE 'plpgsql';
-
-CREATE OR REPLACE FUNCTION refresh_account_cached_counts(rh_account_in varchar)
-    RETURNS void AS
-$refresh_account_cached_counts$
-DECLARE
-    rh_account_id_in INT;
-BEGIN
-    -- update advisory count for ordered systems
-    SELECT id FROM rh_account WHERE name = rh_account_in INTO rh_account_id_in;
-
-    PERFORM refresh_system_caches(NULL, rh_account_id_in);
-    PERFORM refresh_advisory_caches(NULL, rh_account_id_in);
-END;
-$refresh_account_cached_counts$
-    LANGUAGE 'plpgsql';
-
-CREATE OR REPLACE FUNCTION refresh_advisory_cached_counts(advisory_name varchar)
-    RETURNS void AS
-$refresh_advisory_cached_counts$
-DECLARE
-    advisory_id_id INT;
-BEGIN
-    -- update system count for advisory
-    SELECT id FROM advisory_metadata WHERE name = advisory_name INTO advisory_id_id;
-
-    PERFORM refresh_advisory_caches(advisory_id_id, NULL);
-END;
-$refresh_advisory_cached_counts$
-    LANGUAGE 'plpgsql';
-
-CREATE OR REPLACE FUNCTION refresh_advisory_account_cached_counts(advisory_name varchar, rh_account_name varchar)
-    RETURNS void AS
-$refresh_advisory_account_cached_counts$
-DECLARE
-    advisory_md_id   INT;
-    rh_account_id_in INT;
-BEGIN
-    -- update system count for ordered advisories
-    SELECT id FROM advisory_metadata WHERE name = advisory_name INTO advisory_md_id;
-    SELECT id FROM rh_account WHERE name = rh_account_name INTO rh_account_id_in;
-
-    PERFORM refresh_advisory_caches(advisory_md_id, rh_account_id_in);
-END;
-$refresh_advisory_account_cached_counts$
-    LANGUAGE 'plpgsql';
-
-CREATE OR REPLACE FUNCTION refresh_system_cached_counts(inventory_id_in varchar)
-    RETURNS void AS
-$refresh_system_cached_counts$
-DECLARE
-    system_id int;
-BEGIN
-
-    SELECT id FROM system_platform WHERE inventory_id = inventory_id_in INTO system_id;
-
-    PERFORM refresh_system_caches(system_id, NULL);
-END;
-$refresh_system_cached_counts$
-    LANGUAGE 'plpgsql';
+-- -----------------------------------------------------
+-- Table vmaas.evr
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS evr (
+  id SERIAL,
+  epoch TEXT NOT NULL, CHECK (NOT empty(epoch)),
+  version TEXT NOT NULL, CHECK (NOT empty(version)),
+  release TEXT NOT NULL, CHECK (NOT empty(release)),
+  evr evr_t NOT NULL,
+  UNIQUE (epoch, version, release),
+  PRIMARY KEY (id)
+)TABLESPACE pg_default;
 
 
-CREATE OR REPLACE FUNCTION refresh_latest_packages_view()
-    RETURNS void
-    SECURITY DEFINER
-AS
-$$
-BEGIN
-    REFRESH MATERIALIZED VIEW package_latest_cache WITH DATA;
-    RETURN;
-END;
-$$ LANGUAGE plpgsql;
+-- -----------------------------------------------------
+-- Table vmaas.arch
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS arch (
+  id SERIAL,
+  name TEXT NOT NULL UNIQUE, CHECK (NOT empty(name)),
+  PRIMARY KEY (id)
+)TABLESPACE pg_default;
+
+INSERT INTO arch (name) VALUES
+  ('noarch'), ('i386'), ('i486'), ('i586'), ('i686'), ('alpha'), ('alphaev6'), ('ia64'), ('sparc'),
+  ('sparcv9'), ('sparc64'), ('s390'), ('athlon'), ('s390x'), ('ppc'), ('ppc64'), ('ppc64le'),
+  ('pSeries'), ('iSeries'), ('x86_64'), ('ppc64iseries'), ('ppc64pseries'), ('ia32e'), ('amd64'), ('aarch64'),
+  ('armv7hnl'), ('armv7hl'), ('armv7l'), ('armv6hl'), ('armv6l'), ('armv5tel'), ('src');
 
 
-CREATE OR REPLACE FUNCTION delete_system(inventory_id_in uuid)
-    RETURNS TABLE
-            (
-                deleted_inventory_id uuid
-            )
-AS
-$delete_system$
-DECLARE
-    v_system_id  INT;
-    v_account_id INT;
-BEGIN
-    -- opt out to refresh cache and then delete
-    SELECT id, rh_account_id
-    FROM system_platform
-    WHERE inventory_id = inventory_id_in
-    LIMIT 1
-        FOR UPDATE OF system_platform
-    INTO v_system_id, v_account_id;
+-- -----------------------------------------------------
+-- Table vmaas.arch_compatibility
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS arch_compatibility (
+  from_arch_id INT NOT NULL,
+  to_arch_id INT NOT NULL,
 
-    IF v_system_id IS NULL OR v_account_id IS NULL THEN
-        RAISE NOTICE 'Not found';
-        RETURN;
-    END IF;
+  CONSTRAINT from_arch_id
+    FOREIGN KEY (from_arch_id)
+    REFERENCES arch (id),
+  CONSTRAINT to_arch_id
+    FOREIGN KEY (to_arch_id)
+    REFERENCES arch (id)
+)TABLESPACE pg_default;
 
-    UPDATE system_platform
-    SET stale = true
-    WHERE rh_account_id = v_account_id
-      AND id = v_system_id;
+INSERT INTO arch_compatibility (from_arch_id, to_arch_id)
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'noarch' AND t.name = 'noarch'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'i386' AND t.name = 'noarch'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'i386' AND t.name = 'i386'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'noarch' AND t.name = 'i386'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'i486' AND t.name = 'noarch'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'i486' AND t.name = 'i486'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'noarch' AND t.name = 'i486'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'i586' AND t.name = 'noarch'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'i586' AND t.name = 'i586'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'noarch' AND t.name = 'i586'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'i686' AND t.name = 'noarch'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'i686' AND t.name = 'i686'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'noarch' AND t.name = 'i686'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'alpha' AND t.name = 'noarch'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'alpha' AND t.name = 'alpha'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'noarch' AND t.name = 'alpha'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'alphaev6' AND t.name = 'noarch'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'alphaev6' AND t.name = 'alphaev6'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'noarch' AND t.name = 'alphaev6'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'ia64' AND t.name = 'noarch'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'ia64' AND t.name = 'ia64'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'noarch' AND t.name = 'ia64'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'sparc' AND t.name = 'noarch'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'sparc' AND t.name = 'sparc'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'noarch' AND t.name = 'sparc'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'sparcv9' AND t.name = 'noarch'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'sparcv9' AND t.name = 'sparcv9'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'noarch' AND t.name = 'sparcv9'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'sparc64' AND t.name = 'noarch'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'sparc64' AND t.name = 'sparc64'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'noarch' AND t.name = 'sparc64'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 's390' AND t.name = 'noarch'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 's390' AND t.name = 's390'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'noarch' AND t.name = 's390'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'athlon' AND t.name = 'noarch'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'athlon' AND t.name = 'athlon'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'noarch' AND t.name = 'athlon'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 's390x' AND t.name = 'noarch'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 's390x' AND t.name = 's390x'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'noarch' AND t.name = 's390x'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'ppc' AND t.name = 'noarch'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'ppc' AND t.name = 'ppc'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'noarch' AND t.name = 'ppc'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'ppc64' AND t.name = 'noarch'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'ppc64' AND t.name = 'ppc64'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'noarch' AND t.name = 'ppc64le'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'ppc64le' AND t.name = 'ppc64le'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'ppc64le' AND t.name = 'noarch'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'noarch' AND t.name = 'ppc64'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'pseries' AND t.name = 'noarch'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'pseries' AND t.name = 'pseries'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'noarch' AND t.name = 'pseries'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'iseries' AND t.name = 'noarch'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'iseries' AND t.name = 'iseries'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'noarch' AND t.name = 'iseries'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'x86_64' AND t.name = 'noarch'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'x86_64' AND t.name = 'x86_64'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'noarch' AND t.name = 'x86_64'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'ppc64iseries' AND t.name = 'noarch'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'ppc64iseries' AND t.name = 'ppc64iseries'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'noarch' AND t.name = 'ppc64iseries'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'ppc64pseries' AND t.name = 'noarch'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'ppc64pseries' AND t.name = 'ppc64pseries'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'noarch' AND t.name = 'ppc64pseries'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'noarch' AND t.name = 'armv7l'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'armv7l' AND t.name = 'armv7l'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'armv7l' AND t.name = 'noarch'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'noarch' AND t.name = 'armv6hl'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'armv6hl' AND t.name = 'armv6hl'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'armv6hl' AND t.name = 'noarch'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'noarch' AND t.name = 'armv6l'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'armv6l' AND t.name = 'armv6l'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'armv6l' AND t.name = 'noarch'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'noarch' AND t.name = 'armv5tel'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'armv5tel' AND t.name = 'armv5tel'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'armv5tel' AND t.name = 'noarch'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'noarch' AND t.name = 'armv7hl'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'armv7hl' AND t.name = 'armv7hl'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'armv7hl' AND t.name = 'noarch'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'noarch' AND t.name = 'armv7hnl'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'armv7hnl' AND t.name = 'armv7hnl'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'armv7hnl' AND t.name = 'noarch'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'noarch' AND t.name = 'aarch64'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'aarch64' AND t.name = 'aarch64'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'aarch64' AND t.name = 'noarch'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'amd64' AND t.name = 'noarch'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'amd64' AND t.name = 'amd64'
+  UNION ALL
+  SELECT f.id, t.id FROM arch AS f, arch AS t WHERE f.name = 'noarch' AND t.name = 'amd64';
 
-    DELETE
-    FROM system_advisories
-    WHERE rh_account_id = v_account_id
-      AND system_id = v_system_id;
 
-    DELETE
-    FROM system_repo
-    WHERE rh_account_id = v_account_id
-      AND system_id = v_system_id;
+-- -----------------------------------------------------
+-- Table vmaas.package_name
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS package_name (
+  id SERIAL,
+  name TEXT NOT NULL UNIQUE, CHECK (NOT empty(name)),
+  PRIMARY KEY (id)
+)TABLESPACE pg_default;
 
-    DELETE
-    FROM system_package
-    WHERE rh_account_id = v_account_id
-      AND system_id = v_system_id;
 
-    RETURN QUERY DELETE FROM system_platform
-        WHERE rh_account_id = v_account_id AND
-              id = v_system_id
-        RETURNING inventory_id;
-END;
-$delete_system$ LANGUAGE 'plpgsql';
+-- -----------------------------------------------------
+-- Table vmaas.package
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS package (
+  id SERIAL,
+  name_id INT NOT NULL,
+  evr_id INT NOT NULL,
+  arch_id INT NOT NULL,
+  summary TEXT NULL, CHECK (NOT empty(summary)),
+  description TEXT NULL, CHECK (NOT empty(description)),
+  source_package_id INT NULL,
+  modified TIMESTAMP NOT NULL DEFAULT (now() at time zone 'utc'),
+  UNIQUE (name_id, evr_id, arch_id),
+  PRIMARY KEY (id),
+  CONSTRAINT name_id
+    FOREIGN KEY (name_id)
+    REFERENCES package_name (id),
+  CONSTRAINT evr_id
+    FOREIGN KEY (evr_id)
+    REFERENCES evr (id),
+  CONSTRAINT arch_id
+    FOREIGN KEY (arch_id)
+    REFERENCES arch (id),
+  CONSTRAINT source_package_id
+    FOREIGN KEY (source_package_id)
+    REFERENCES package (id)
+)TABLESPACE pg_default;
 
-CREATE OR REPLACE FUNCTION delete_systems(inventory_ids UUID[])
-    RETURNS INTEGER
-AS
-$$
-DECLARE
-    tmp_cnt INTEGER;
-BEGIN
+CREATE INDEX ON package(name_id);
+CREATE INDEX ON package(evr_id);
+CREATE INDEX ON package(source_package_id);
 
-    WITH systems as (
-        SELECT rh_account_id, id
-        FROM system_platform
-        WHERE inventory_id = ANY (inventory_ids)
-        ORDER BY rh_account_id, id FOR UPDATE OF system_platform),
-         marked as (
-             UPDATE system_platform sp
-                 SET stale = true
-                 WHERE (rh_account_id, id) in (select rh_account_id, id from systems)
-         ),
-         advisories as (
-             DELETE
-                 FROM system_advisories
-                     WHERE (rh_account_id, system_id) in (select rh_account_id, id from systems)
-         ),
-         repos as (
-             DELETE
-                 FROM system_repo
-                     WHERE (rh_account_id, system_id) in (select rh_account_id, id from systems)
-         ),
-         packages as (
-             DELETE
-                 FROM system_package
-                     WHERE (rh_account_id, system_id) in (select rh_account_id, id from systems)
-         ),
-         deleted as (
-             DELETE
-                 FROM system_platform
-                     WHERE (rh_account_id, id) in (select rh_account_id, id from systems)
-                     RETURNING id
-         )
-    SELECT count(*)
-    FROM deleted
-    INTO tmp_cnt;
 
-    RETURN tmp_cnt;
-END
-$$ LANGUAGE plpgsql;
+-- -----------------------------------------------------
+-- Table vmaas.product
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS product (
+  id SERIAL,
+  name TEXT NOT NULL UNIQUE, CHECK (NOT empty(name)),
+  redhat_eng_product_id INT NULL UNIQUE,
+  PRIMARY KEY (id)
+)TABLESPACE pg_default;
 
-CREATE OR REPLACE FUNCTION delete_culled_systems(delete_limit INTEGER)
-    RETURNS INTEGER
-AS
-$fun$
-DECLARE
-    ids UUID[];
-BEGIN
-    ids := ARRAY(
-            SELECT inventory_id
-            FROM system_platform
-            WHERE culled_timestamp < now()
-            ORDER BY id
-            LIMIT delete_limit
-        );
-    return delete_systems(ids);
-END;
-$fun$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION mark_stale_systems(mark_limit integer)
-    RETURNS INTEGER
-AS
-$fun$
-DECLARE
-    marked integer;
-BEGIN
-    WITH ids AS (
-        SELECT rh_account_id, id
-        FROM system_platform
-        WHERE stale_warning_timestamp < now()
-          AND stale = false
-        ORDER BY rh_account_id, id FOR UPDATE OF system_platform
-        LIMIT mark_limit
-    )
-    UPDATE system_platform sp
-    SET stale = true
-    FROM ids
-    WHERE sp.rh_account_id = ids.rh_account_id
-      AND sp.id = ids.id;
-    GET DIAGNOSTICS marked = ROW_COUNT;
-    RETURN marked;
-END;
-$fun$ LANGUAGE plpgsql;
+-- -----------------------------------------------------
+-- Table vmaas.cpe
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS cpe (
+  id SERIAL,
+  label TEXT NOT NULL UNIQUE, CHECK (NOT empty(label)),
+  name TEXT NULL, CHECK (NOT empty(name)),
+  PRIMARY KEY (id)
+)TABLESPACE pg_default;
+CREATE TRIGGER cpe_changed AFTER INSERT OR UPDATE OR DELETE ON cpe
+  FOR EACH STATEMENT
+  EXECUTE PROCEDURE cpes_changed();
 
-CREATE OR REPLACE FUNCTION create_table_partitions(tbl regclass, parts INTEGER, rest text)
-    RETURNS VOID AS
-$$
-DECLARE
-    I INTEGER;
-BEGIN
-    I := 0;
-    WHILE I < parts
-        LOOP
-            EXECUTE 'CREATE TABLE IF NOT EXISTS ' || text(tbl) || '_' || text(I) || ' PARTITION OF ' || text(tbl) ||
-                    ' FOR VALUES WITH ' || ' ( MODULUS ' || text(parts) || ', REMAINDER ' || text(I) || ')' ||
-                    rest || ';';
-            I = I + 1;
-        END LOOP;
-END;
-$$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION create_table_partition_triggers(name text, trig_type text, tbl regclass, trig_text text)
-    RETURNS VOID AS
-$$
-DECLARE
-    r record;
-    trig_name text;
-BEGIN
-    FOR r IN SELECT child.relname
-               FROM pg_inherits
-               JOIN pg_class parent
-                 ON pg_inherits.inhparent = parent.oid
-               JOIN pg_class child
-                 ON pg_inherits.inhrelid   = child.oid
-              WHERE parent.relname = text(tbl)
-    LOOP
-        trig_name := name || substr(r.relname, length(text(tbl)) +1 );
-        EXECUTE 'DROP TRIGGER IF EXISTS ' || trig_name || ' ON ' || r.relname;
-        EXECUTE 'CREATE TRIGGER ' || trig_name ||
-                ' ' || trig_type || ' ON ' || r.relname || ' ' || trig_text || ';';
-    END LOOP;
-END;
-$$ LANGUAGE plpgsql;
+-- -----------------------------------------------------
+-- Table vmaas.content_set
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS content_set (
+  id SERIAL,
+  label TEXT NOT NULL UNIQUE, CHECK (NOT empty(label)),
+  name TEXT NULL, CHECK (NOT empty(name)),
+  product_id INT NOT NULL,
+  third_party BOOLEAN NOT NULL DEFAULT FALSE,
+  PRIMARY KEY (id),
+  CONSTRAINT product_id
+    FOREIGN KEY (product_id)
+    REFERENCES product (id)
+)TABLESPACE pg_default;
 
-CREATE OR REPLACE FUNCTION rename_table_with_partitions(tbl regclass, oldtext text, newtext text)
-    RETURNS VOID AS
-$$
-DECLARE
-    r record;
-BEGIN
-    FOR r IN SELECT child.relname
-               FROM pg_inherits
-               JOIN pg_class parent
-                 ON pg_inherits.inhparent = parent.oid
-               JOIN pg_class child
-                 ON pg_inherits.inhrelid   = child.oid
-              WHERE parent.relname = text(tbl)
-    LOOP
-        EXECUTE 'ALTER TABLE IF EXISTS ' || r.relname || ' RENAME TO ' || replace(r.relname, oldtext, newtext);
-    END LOOP;
-    EXECUTE 'ALTER TABLE IF EXISTS ' || text(tbl) || ' RENAME TO ' || replace(text(tbl), oldtext, newtext);
-END;
-$$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION drop_table_partition_triggers(name text, trig_type text, tbl regclass, trig_text text)
-    RETURNS VOID AS
-$$
-DECLARE
-    r record;
-    trig_name text;
-BEGIN
-    FOR r IN SELECT child.relname
-               FROM pg_inherits
-               JOIN pg_class parent
-                 ON pg_inherits.inhparent = parent.oid
-               JOIN pg_class child
-                 ON pg_inherits.inhrelid   = child.oid
-              WHERE parent.relname = text(tbl)
-    LOOP
-        trig_name := name || substr(r.relname, length(text(tbl)) +1 );
-        EXECUTE 'DROP TRIGGER IF EXISTS ' || trig_name || ' ON ' || r.relname;
-    END LOOP;
-END;
-$$ LANGUAGE plpgsql;
+-- -----------------------------------------------------
+-- Table vmaas.certificate
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS certificate (
+  id SERIAL,
+  name TEXT NOT NULL UNIQUE, CHECK (NOT empty(name)),
+  ca_cert TEXT NOT NULL, CHECK (NOT empty(ca_cert)),
+  cert TEXT NULL, CHECK (NOT empty(cert)),
+  key TEXT NULL, CHECK (NOT empty(key)),
+  CONSTRAINT cert_key CHECK(key IS NULL OR cert IS NOT NULL),
+  PRIMARY KEY (id)
+)TABLESPACE pg_default;
 
-CREATE OR REPLACE FUNCTION rename_index_with_partitions(idx regclass, oldtext text, newtext text)
-    RETURNS VOID AS
-$$
-DECLARE
-    r record;
-BEGIN
-    FOR r IN SELECT child.relname
-               FROM pg_inherits
-               JOIN pg_class parent
-                 ON pg_inherits.inhparent = parent.oid
-               JOIN pg_class child
-                 ON pg_inherits.inhrelid   = child.oid
-              WHERE parent.relname = text(idx)
-    LOOP
-        EXECUTE 'ALTER INDEX IF EXISTS ' || r.relname || ' RENAME TO ' || replace(r.relname, oldtext, newtext);
-    END LOOP;
-    EXECUTE 'ALTER INDEX IF EXISTS ' || text(idx) || ' RENAME TO ' || replace(text(idx), oldtext, newtext);
-END;
-$$ LANGUAGE plpgsql;
 
--- rh_account
-CREATE TABLE IF NOT EXISTS rh_account
-(
-    id   INT GENERATED BY DEFAULT AS IDENTITY,
-    name TEXT NOT NULL UNIQUE,
-    CHECK (NOT empty(name)),
-    PRIMARY KEY (id)
+-- -----------------------------------------------------
+-- Table vmaas.repo
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS repo (
+  id SERIAL,
+  url TEXT NOT NULL, CHECK (NOT empty(url)),
+  content_set_id INT NOT NULL,
+  basearch_id INT NULL,
+  releasever TEXT NULL, CHECK (NOT empty(releasever)),
+  eol BOOLEAN NOT NULL,
+  revision TIMESTAMP WITH TIME ZONE NULL,
+  certificate_id INT NULL,
+  PRIMARY KEY (id),
+  CONSTRAINT content_set_id
+    FOREIGN KEY (content_set_id)
+    REFERENCES content_set (id),
+  CONSTRAINT basearch_id
+    FOREIGN KEY (basearch_id)
+    REFERENCES arch (id),
+  CONSTRAINT certificate_id
+    FOREIGN KEY (certificate_id)
+    REFERENCES certificate (id)
+)TABLESPACE pg_default;
+CREATE UNIQUE INDEX repo_content_set_id_key ON repo (content_set_id) WHERE basearch_id IS NULL AND releasever IS NULL;
+CREATE UNIQUE INDEX repo_content_set_id_basearch_id_key ON repo (content_set_id, basearch_id) WHERE basearch_id IS NOT NULL AND releasever IS NULL;
+CREATE UNIQUE INDEX repo_content_set_id_releasever_key ON repo (content_set_id, releasever) WHERE basearch_id IS NULL AND releasever IS NOT NULL;
+CREATE UNIQUE INDEX repo_content_set_id_basearch_id_releasever_key ON repo (content_set_id, basearch_id, releasever) WHERE basearch_id IS NOT NULL AND releasever IS NOT NULL;
+CREATE TRIGGER repo_changed AFTER INSERT OR UPDATE OR DELETE ON repo
+  FOR EACH STATEMENT
+  EXECUTE PROCEDURE repos_changed();
+
+
+-- -----------------------------------------------------
+-- Table vmaas.pkg_repo
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS pkg_repo (
+  pkg_id INT NOT NULL,
+  repo_id INT NOT NULL,
+  UNIQUE (pkg_id, repo_id),
+  CONSTRAINT pkg_id
+    FOREIGN KEY (pkg_id)
+    REFERENCES package (id),
+  CONSTRAINT repo_id
+    FOREIGN KEY (repo_id)
+    REFERENCES repo (id)
+)TABLESPACE pg_default;
+CREATE TRIGGER pkg_repo_changed AFTER INSERT OR UPDATE OR DELETE ON pkg_repo
+  FOR EACH STATEMENT
+  EXECUTE PROCEDURE repos_changed();
+
+CREATE INDEX ON pkg_repo(repo_id);
+
+
+-- -----------------------------------------------------
+-- Table vmaas.cpe_content_set
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS cpe_content_set (
+  cpe_id INT NOT NULL,
+  content_set_id INT NOT NULL,
+  UNIQUE (cpe_id, content_set_id),
+  CONSTRAINT cpe_id
+    FOREIGN KEY (cpe_id)
+    REFERENCES cpe (id),
+  CONSTRAINT content_set_id
+    FOREIGN KEY (content_set_id)
+    REFERENCES content_set (id)
+)TABLESPACE pg_default;
+CREATE TRIGGER cpe_changed AFTER INSERT OR UPDATE OR DELETE ON cpe_content_set
+  FOR EACH STATEMENT
+  EXECUTE PROCEDURE cpes_changed();
+
+CREATE INDEX ON cpe_content_set(content_set_id);
+
+
+-- -----------------------------------------------------
+-- Table vmaas.cpe_repo
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS cpe_repo (
+  cpe_id INT NOT NULL,
+  repo_id INT NOT NULL,
+  UNIQUE (cpe_id, repo_id),
+  CONSTRAINT cpe_id
+    FOREIGN KEY (cpe_id)
+    REFERENCES cpe (id),
+  CONSTRAINT repo_id
+    FOREIGN KEY (repo_id)
+    REFERENCES repo (id)
+)TABLESPACE pg_default;
+CREATE TRIGGER cpe_changed AFTER INSERT OR UPDATE OR DELETE ON cpe_repo
+  FOR EACH STATEMENT
+  EXECUTE PROCEDURE cpes_changed();
+
+CREATE INDEX ON cpe_repo(repo_id);
+
+
+-- -----------------------------------------------------
+-- Table vmaas.errata_severity
+-- from https://access.redhat.com/security/updates/classification
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS errata_severity (
+  id INT NOT NULL,
+  name TEXT UNIQUE, CHECK (NOT empty(name)),
+  PRIMARY KEY (id)
+)TABLESPACE pg_default;
+
+INSERT INTO errata_severity (id, name) VALUES
+  (1, NULL), (2, 'Low'), (3, 'Moderate'), (4, 'Important'), (5, 'Critical');
+
+
+-- -----------------------------------------------------
+-- Table vmaas.errata_type
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS errata_type (
+  id SERIAL,
+  name TEXT NOT NULL UNIQUE, CHECK (NOT empty(name)),
+  PRIMARY KEY (id)
+)TABLESPACE pg_default;
+
+
+-- -----------------------------------------------------
+-- Table vmaas.errata
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS errata (
+  id SERIAL,
+  name TEXT NOT NULL UNIQUE, CHECK (NOT empty(name)),
+  synopsis TEXT, CHECK (NOT empty(synopsis)),
+  severity_id INT,
+  errata_type_id INT NOT NULL,
+  summary TEXT, CHECK (NOT empty(summary)),
+  description TEXT, CHECK (NOT empty(description)),
+  solution TEXT, CHECK (NOT empty(solution)),
+  issued TIMESTAMP WITH TIME ZONE NOT NULL,
+  updated TIMESTAMP WITH TIME ZONE NOT NULL,
+  requires_reboot BOOLEAN NOT NULL DEFAULT TRUE,
+  PRIMARY KEY (id),
+  CONSTRAINT severity_id
+    FOREIGN KEY (severity_id)
+    REFERENCES errata_severity (id),
+  CONSTRAINT errata_type_id
+    FOREIGN KEY (errata_type_id)
+    REFERENCES errata_type (id)
+)TABLESPACE pg_default;
+CREATE TRIGGER errata_changed AFTER INSERT OR UPDATE OR DELETE ON errata
+  FOR EACH STATEMENT
+  EXECUTE PROCEDURE errata_changed();
+
+
+-- -----------------------------------------------------
+-- Table vmaas.errata_repo
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS errata_repo (
+  errata_id INT NOT NULL,
+  repo_id INT NOT NULL,
+  UNIQUE (errata_id, repo_id),
+  CONSTRAINT errata_id
+    FOREIGN KEY (errata_id)
+    REFERENCES errata (id),
+  CONSTRAINT repo_id
+    FOREIGN KEY (repo_id)
+    REFERENCES repo (id)
+)TABLESPACE pg_default;
+CREATE TRIGGER errata_repo AFTER INSERT OR UPDATE OR DELETE ON errata_repo
+  FOR EACH STATEMENT
+  EXECUTE PROCEDURE errata_changed();
+
+CREATE INDEX ON errata_repo(repo_id);
+
+
+-- -----------------------------------------------------
+-- Table vmaas.cve_impact
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS cve_impact (
+  id INT NOT NULL,
+  name TEXT NOT NULL UNIQUE, CHECK (NOT empty(name)),
+  PRIMARY KEY (id)
+)TABLESPACE pg_default;
+
+INSERT INTO cve_impact (id, name) VALUES
+  (0, 'NotSet'), (1, 'None'), (2, 'Low'), (3, 'Medium'), (4, 'Moderate'),
+  (5, 'Important'), (6, 'High'), (7, 'Critical');
+
+-- -----------------------------------------------------
+-- Table vmaas.cve_source
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS cve_source (
+  id INT NOT NULL,
+  name TEXT NOT NULL UNIQUE, CHECK (NOT empty(name)),
+  PRIMARY KEY (id)
+)TABLESPACE pg_default;
+
+INSERT INTO cve_source (id, name) VALUES
+  (1, 'Red Hat');
+
+-- -----------------------------------------------------
+-- Table vmaas.cve
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS cve (
+  id SERIAL,
+  name TEXT NOT NULL UNIQUE, CHECK (NOT empty(name)),
+  description TEXT NULL, CHECK (NOT empty(description)),
+  impact_id INT NOT NULL DEFAULT 0,
+  published_date TIMESTAMP WITH TIME ZONE NULL,
+  modified_date TIMESTAMP WITH TIME ZONE NULL,
+  cvss3_score NUMERIC(5,3),
+  cvss3_metrics TEXT, CHECK (NOT empty(cvss3_metrics)),
+  iava TEXT, CHECK (NOT empty(iava)),
+  redhat_url TEXT, CHECK (NOT empty(redhat_url)),
+  secondary_url TEXT, CHECK (NOT empty(secondary_url)),
+  source_id INT,
+  cvss2_score NUMERIC(5,3),
+  cvss2_metrics TEXT, CHECK (NOT empty(cvss2_metrics)),
+  PRIMARY KEY (id),
+  CONSTRAINT impact_id
+    FOREIGN KEY (impact_id)
+    REFERENCES cve_impact (id),
+  CONSTRAINT cve_source_id
+    FOREIGN KEY (source_id)
+    REFERENCES cve_source (id)
+)TABLESPACE pg_default;
+CREATE TRIGGER cve_changed AFTER INSERT OR UPDATE OR DELETE ON cve
+  FOR EACH STATEMENT
+  EXECUTE PROCEDURE cves_changed();
+
+-- -----------------------------------------------------
+-- Table vmaas.cwe
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS cwe (
+  id SERIAL,
+  name TEXT NOT NULL UNIQUE, CHECK (NOT empty(name)),
+  link TEXT NOT NULL, CHECK (NOT empty(link)),
+  PRIMARY KEY (id)
+)TABLESPACE pg_default;
+-- -----------------------------------------------------
+-- Table vmaas.cve_cwe
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS cve_cwe (
+  cve_id INT NOT NULL,
+  cwe_id INT NOT NULL,
+  UNIQUE (cve_id, cwe_id),
+  CONSTRAINT cve_id
+    FOREIGN KEY (cve_id)
+    REFERENCES cve (id),
+  CONSTRAINT cwe_id
+    FOREIGN KEY (cwe_id)
+    REFERENCES cwe (id)
+)TABLESPACE pg_default;
+CREATE TRIGGER cve_cwe_changed AFTER INSERT OR UPDATE OR DELETE ON cve_cwe
+  FOR EACH STATEMENT
+  EXECUTE PROCEDURE cves_changed();
+
+CREATE INDEX ON cve_cwe(cwe_id);
+
+
+-- -----------------------------------------------------
+-- Table vmaas.errata_cve
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS errata_cve (
+  errata_id INT NOT NULL,
+  cve_id INT NOT NULL,
+  UNIQUE (errata_id, cve_id),
+  CONSTRAINT errata_id
+    FOREIGN KEY (errata_id)
+    REFERENCES errata (id),
+  CONSTRAINT cve_id
+    FOREIGN KEY (cve_id)
+    REFERENCES cve (id)
+)TABLESPACE pg_default;
+CREATE TRIGGER errata_cve_changed AFTER INSERT OR UPDATE OR DELETE ON errata_cve
+  FOR EACH STATEMENT
+  EXECUTE PROCEDURE errata_changed();
+
+CREATE INDEX ON errata_cve(cve_id);
+
+
+-- -----------------------------------------------------
+-- Table vmaas.errata_refs
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS errata_refs (
+  errata_id INT NOT NULL,
+  type TEXT NOT NULL, CHECK (NOT empty(type)),
+  name TEXT NOT NULL, CHECK (NOT empty(name)),
+  UNIQUE (errata_id, type, name),
+  CONSTRAINT errata_id
+    FOREIGN KEY (errata_id)
+    REFERENCES errata (id)
+)TABLESPACE pg_default;
+CREATE TRIGGER errata_refs_changed AFTER INSERT OR UPDATE OR DELETE ON errata_refs
+  FOR EACH STATEMENT
+  EXECUTE PROCEDURE errata_changed();
+
+-- -----------------------------------------------------
+-- Table vmaas.metadata
+-- -----------------------------------------------------
+-- This table holds different timestamps, checksums and
+-- other persistent data for vmaas processes.
+-- E.g. source timestamps for cve importer
+
+CREATE TABLE IF NOT EXISTS metadata (
+  id SERIAL,
+  key TEXT NOT NULL UNIQUE, CHECK (NOT empty(key)),
+  value TEXT NOT NULL, CHECK (NOT empty(value)),
+  PRIMARY KEY (id)
+)TABLESPACE pg_default;
+
+-- Table vmaas.dbchange
+-- This table is updated by database triggers on changes to errata, cve, or repo entities
+-- It provides a shortcut for external users to be able to tell if there is any 'new' data
+-- since they last talked to the db
+CREATE TABLE IF NOT EXISTS  dbchange (
+  errata_changes TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  cpe_changes TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  cve_changes TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  repository_changes TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  last_change TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  pkgtree_change TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+)TABLESPACE pg_default;
+CREATE TRIGGER last_change AFTER UPDATE OF errata_changes, cpe_changes, cve_changes, repository_changes, pkgtree_change ON dbchange
+  FOR EACH STATEMENT EXECUTE PROCEDURE last_change();
+INSERT INTO dbchange (errata_changes, cpe_changes, cve_changes, repository_changes, pkgtree_change)
+  VALUES (CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+
+-- -----------------------------------------------------
+-- Table vmaas.module
+-- -----------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS module (
+  id SERIAL,
+  name VARCHAR(32) NOT NULL,
+  repo_id INT NOT NULL,
+  arch_id INT NOT NULL,
+  PRIMARY KEY (id),
+  CONSTRAINT repo_id
+    FOREIGN KEY (repo_id)
+    REFERENCES repo (id),
+  CONSTRAINT arch_id
+    FOREIGN KEY (arch_id)
+    REFERENCES arch (id),
+  CONSTRAINT module_name_repo_arch_id_uq
+    UNIQUE (name, repo_id, arch_id)
 ) TABLESPACE pg_default;
 
-GRANT SELECT, INSERT, UPDATE, DELETE ON rh_account TO listener;
-GRANT SELECT, UPDATE ON rh_account TO evaluator;
+-- -----------------------------------------------------
+-- Table vmaas.module_stream
+-- -----------------------------------------------------
 
-CREATE TABLE reporter
-(
-    id   INT  NOT NULL,
-    name TEXT NOT NULL UNIQUE CHECK ( not empty(name) ),
-    PRIMARY KEY (id)
-);
-
-INSERT INTO reporter (id, name)
-VALUES (1, 'puptoo'),
-       (2, 'rhsm-conduit'),
-       (3, 'yupana')
-ON CONFLICT DO NOTHING;
-
--- baseline
-CREATE TABLE IF NOT EXISTS baseline
-(
-    id            INT               GENERATED BY DEFAULT AS IDENTITY,
-    rh_account_id INT               NOT NULL REFERENCES rh_account (id),
-    name          TEXT              NOT NULL,
-    config        JSONB,
-    PRIMARY KEY (rh_account_id, id)
-) PARTITION BY HASH (rh_account_id);
-
-GRANT SELECT, UPDATE, DELETE, INSERT ON baseline TO manager;
-GRANT SELECT, UPDATE, DELETE ON baseline TO listener;
-GRANT SELECT, UPDATE, DELETE ON baseline TO evaluator;
-GRANT SELECT, UPDATE, DELETE ON baseline TO vmaas_sync;
-
-SELECT create_table_partitions('baseline', 16,
-                               $$WITH (fillfactor = '70', autovacuum_vacuum_scale_factor = '0.05')$$);
-
--- system_platform
-CREATE TABLE IF NOT EXISTS system_platform
-(
-    id                       INT GENERATED BY DEFAULT AS IDENTITY,
-    inventory_id             UUID                     NOT NULL,
-    rh_account_id            INT                      NOT NULL,
-    vmaas_json               TEXT,
-    json_checksum            TEXT,
-    last_updated             TIMESTAMP WITH TIME ZONE NOT NULL,
-    unchanged_since          TIMESTAMP WITH TIME ZONE NOT NULL,
-    last_evaluation          TIMESTAMP WITH TIME ZONE,
-    advisory_count_cache     INT                      NOT NULL DEFAULT 0,
-    advisory_enh_count_cache INT                      NOT NULL DEFAULT 0,
-    advisory_bug_count_cache INT                      NOT NULL DEFAULT 0,
-    advisory_sec_count_cache INT                      NOT NULL DEFAULT 0,
-
-    last_upload              TIMESTAMP WITH TIME ZONE,
-    stale_timestamp          TIMESTAMP WITH TIME ZONE,
-    stale_warning_timestamp  TIMESTAMP WITH TIME ZONE,
-    culled_timestamp         TIMESTAMP WITH TIME ZONE,
-    stale                    BOOLEAN                  NOT NULL DEFAULT false,
-    display_name             TEXT                     NOT NULL CHECK (NOT empty(display_name)),
-    packages_installed       INT                      NOT NULL DEFAULT 0,
-    packages_updatable       INT                      NOT NULL DEFAULT 0,
-    reporter_id              INT,
-    third_party              BOOLEAN                  NOT NULL DEFAULT false,
-    baseline_id              INT,
-    baseline_uptodate        BOOLEAN,
-    PRIMARY KEY (rh_account_id, id),
-    UNIQUE (rh_account_id, inventory_id),
-    CONSTRAINT reporter_id FOREIGN KEY (reporter_id) REFERENCES reporter (id),
-    CONSTRAINT baseline_id FOREIGN KEY (rh_account_id, baseline_id) REFERENCES baseline (rh_account_id, id)
-) PARTITION BY HASH (rh_account_id);
-
-SELECT create_table_partitions('system_platform', 16,
-                               $$WITH (fillfactor = '70', autovacuum_vacuum_scale_factor = '0.05')
-                                 TABLESPACE pg_default$$);
-
-SELECT create_table_partition_triggers('system_platform_set_last_updated',
-                                       $$BEFORE INSERT OR UPDATE$$,
-                                       'system_platform',
-                                       $$FOR EACH ROW EXECUTE PROCEDURE set_last_updated()$$);
-
-SELECT create_table_partition_triggers('system_platform_check_unchanged',
-                                       $$BEFORE INSERT OR UPDATE$$,
-                                       'system_platform',
-                                       $$FOR EACH ROW EXECUTE PROCEDURE check_unchanged()$$);
-
-SELECT create_table_partition_triggers('system_platform_on_update',
-                                       $$AFTER UPDATE$$,
-                                       'system_platform',
-                                       $$FOR EACH ROW EXECUTE PROCEDURE on_system_update()$$);
-
-CREATE INDEX IF NOT EXISTS system_platform_inventory_id_idx
-    ON system_platform (inventory_id);
-
-GRANT SELECT, INSERT, UPDATE, DELETE ON system_platform TO listener;
--- evaluator needs to update last_evaluation
-GRANT UPDATE ON system_platform TO evaluator;
--- manager needs to update cache and delete systems
-GRANT UPDATE (advisory_count_cache,
-              advisory_enh_count_cache,
-              advisory_bug_count_cache,
-              advisory_sec_count_cache), DELETE ON system_platform TO manager;
-              
-GRANT SELECT, UPDATE, DELETE ON system_platform TO manager;
-
--- VMaaS sync needs to be able to perform system culling tasks
-GRANT SELECT, UPDATE, DELETE ON system_platform to vmaas_sync;
-
-CREATE TABLE IF NOT EXISTS deleted_system
-(
-    inventory_id TEXT                     NOT NULL,
-    CHECK (NOT empty(inventory_id)),
-    when_deleted TIMESTAMP WITH TIME ZONE NOT NULL,
-    UNIQUE (inventory_id)
+CREATE TABLE IF NOT EXISTS module_stream (
+  id SERIAL,
+  module_id INT NOT NULL,
+  stream_name VARCHAR NOT NULL,
+  version BIGINT NOT NULL,
+  context VARCHAR NOT NULL,
+  is_default BOOLEAN NOT NULL,
+  PRIMARY KEY (id),
+  CONSTRAINT module_id
+    FOREIGN KEY (module_id)
+    REFERENCES module (id),
+  CONSTRAINT module_stream_ids_uq
+    UNIQUE (module_id, stream_name, version, context)
 ) TABLESPACE pg_default;
 
-CREATE INDEX ON deleted_system (when_deleted);
+-- -----------------------------------------------------
+-- Table vmaas.module_profile
+-- -----------------------------------------------------
 
-GRANT SELECT, INSERT, UPDATE, DELETE ON deleted_system TO listener;
--- advisory_type
-CREATE TABLE IF NOT EXISTS advisory_type
-(
-    id   INT  NOT NULL,
-    name TEXT NOT NULL UNIQUE,
-    preference INTEGER NOT NULL DEFAULT 0,
-    CHECK (NOT empty(name)),
-    PRIMARY KEY (id)
+CREATE TABLE IF NOT EXISTS module_profile (
+  id SERIAL,
+  stream_id INT NOT NULL,
+  profile_name VARCHAR(16) NOT NULL,
+  is_default BOOLEAN NOT NULL,
+  PRIMARY KEY (id),
+  CONSTRAINT stream_id
+    FOREIGN KEY (stream_id)
+    REFERENCES module_stream (id),
+  CONSTRAINT module_profile_stream_uq
+    UNIQUE (stream_id, profile_name)
 ) TABLESPACE pg_default;
 
-INSERT INTO advisory_type (id, name, preference)
-VALUES (0, 'unknown', 100),
-       (1, 'enhancement', 300),
-       (2, 'bugfix', 400),
-       (3, 'security', 500),
-       (4, 'unspecified', 200)
-ON CONFLICT DO NOTHING;
+-- -----------------------------------------------------
+-- Table vmaas.module_rpm_artifact
+-- -----------------------------------------------------
 
-CREATE TABLE advisory_severity
-(
-    id   INT  NOT NULL,
-    name TEXT NOT NULL UNIQUE CHECK ( not empty(name) ),
-    PRIMARY KEY (id)
-);
-
-INSERT INTO advisory_severity (id, name)
-VALUES (1, 'Low'),
-       (2, 'Moderate'),
-       (3, 'Important'),
-       (4, 'Critical')
-ON CONFLICT DO NOTHING;
-
--- advisory_metadata
-CREATE TABLE IF NOT EXISTS advisory_metadata
-(
-    id               INT GENERATED BY DEFAULT AS IDENTITY,
-    name             TEXT                     NOT NULL,
-    CHECK (NOT empty(name)),
-    description      TEXT                     NOT NULL,
-    CHECK (NOT empty(description)),
-    synopsis         TEXT                     NOT NULL,
-    CHECK (NOT empty(synopsis)),
-    summary          TEXT                     NOT NULL,
-    CHECK (NOT empty(summary)),
-    solution         TEXT                     NOT NULL,
-    advisory_type_id INT                      NOT NULL,
-    public_date      TIMESTAMP WITH TIME ZONE NULL,
-    modified_date    TIMESTAMP WITH TIME ZONE NULL,
-    url              TEXT,
-    severity_id      INT,
-    package_data     JSONB,
-    cve_list         JSONB,
-    reboot_required  BOOLEAN NOT NULL DEFAULT false,
-    release_versions JSONB,
-    UNIQUE (name),
-    PRIMARY KEY (id),
-    CONSTRAINT advisory_type_id
-        FOREIGN KEY (advisory_type_id)
-            REFERENCES advisory_type (id),
-    CONSTRAINT advisory_severity_id
-        FOREIGN KEY (severity_id)
-            REFERENCES advisory_severity (id)
+CREATE TABLE IF NOT EXISTS module_rpm_artifact (
+  pkg_id INT NOT NULL,
+  stream_id INT NOT NULL,
+  CONSTRAINT pkg_id
+    FOREIGN KEY (pkg_id)
+    REFERENCES package (id),
+  CONSTRAINT stream_id
+    FOREIGN KEY (stream_id)
+    REFERENCES module_stream (id),
+  CONSTRAINT module_rpm_artifact_ids_uq
+    UNIQUE (pkg_id, stream_id)
 ) TABLESPACE pg_default;
 
-CREATE INDEX ON advisory_metadata (advisory_type_id);
+-- -----------------------------------------------------
+-- Table vmaas.module_profile_pkg
+-- -----------------------------------------------------
 
-CREATE INDEX IF NOT EXISTS
-    advisory_metadata_pkgdata_idx ON advisory_metadata
-    USING GIN ((advisory_metadata.package_data));
-
-GRANT SELECT, INSERT, UPDATE, DELETE ON advisory_metadata TO evaluator;
-GRANT SELECT, INSERT, UPDATE, DELETE ON advisory_metadata TO vmaas_sync;
--- TODO: Remove
-GRANT SELECT, INSERT, UPDATE, DELETE ON advisory_metadata TO listener;
-GRANT SELECT ON advisory_metadata TO manager;
-
--- status table
-CREATE TABLE IF NOT EXISTS status
-(
-    id   INT  NOT NULL,
-    name TEXT NOT NULL UNIQUE,
-    CHECK (NOT empty(name)),
-    PRIMARY KEY (id)
+CREATE TABLE IF NOT EXISTS module_profile_pkg (
+  package_name_id INT NOT NULL,
+  profile_id INT NOT NULL,
+  CONSTRAINT package_name_id
+    FOREIGN KEY (package_name_id)
+    REFERENCES package_name (id),
+  CONSTRAINT profile_id
+    FOREIGN KEY (profile_id)
+    REFERENCES module_profile (id),
+  CONSTRAINT module_profile_pkg_ids_uq
+    UNIQUE (package_name_id, profile_id)
 ) TABLESPACE pg_default;
 
-INSERT INTO status (id, name)
-VALUES (0, 'Not Reviewed'),
-       (1, 'In-Review'),
-       (2, 'On-Hold'),
-       (3, 'Scheduled for Patch'),
-       (4, 'Resolved'),
-       (5, 'No Action')
-ON CONFLICT DO NOTHING;
+-- -----------------------------------------------------
+-- Table vmaas.module_stream_dep
+-- -----------------------------------------------------
 
-
--- system_advisories
-CREATE TABLE IF NOT EXISTS system_advisories
-(
-    rh_account_id  INT                      NOT NULL,
-    system_id      INT                      NOT NULL,
-    advisory_id    INT                      NOT NULL,
-    first_reported TIMESTAMP WITH TIME ZONE NOT NULL,
-    when_patched   TIMESTAMP WITH TIME ZONE DEFAULT NULL,
-    status_id      INT                      DEFAULT 0,
-    PRIMARY KEY (rh_account_id, system_id, advisory_id),
-    CONSTRAINT system_platform_id
-        FOREIGN KEY (rh_account_id, system_id)
-            REFERENCES system_platform (rh_account_id, id)
-) PARTITION BY HASH (rh_account_id);
-
-SELECT create_table_partitions('system_advisories', 32,
-                               $$WITH (fillfactor = '70', autovacuum_vacuum_scale_factor = '0.05')$$);
-
-SELECT create_table_partition_triggers('system_advisories_set_first_reported',
-                                       $$BEFORE INSERT$$,
-                                       'system_advisories',
-                                       $$FOR EACH ROW EXECUTE PROCEDURE set_first_reported()$$);
-
-GRANT SELECT, INSERT, UPDATE, DELETE ON system_advisories TO evaluator;
--- manager needs to be able to update things like 'status' on a sysid/advisory combination, also needs to delete
-GRANT UPDATE, DELETE ON system_advisories TO manager;
--- manager needs to be able to update opt_out column
-GRANT UPDATE (stale) ON system_platform TO manager;
--- listener deletes systems, TODO: temporary added evaluator permissions to listener
-GRANT SELECT, INSERT, UPDATE, DELETE ON system_advisories TO listener;
--- vmaas_sync needs to delete culled systems, which cascades to system_advisories
-GRANT SELECT, DELETE ON system_advisories TO vmaas_sync;
-
--- advisory_account_data
-CREATE TABLE IF NOT EXISTS advisory_account_data
-(
-    advisory_id              INT NOT NULL,
-    rh_account_id            INT NOT NULL,
-    status_id                INT NOT NULL DEFAULT 0,
-    systems_affected         INT NOT NULL DEFAULT 0,
-    systems_status_divergent INT NOT NULL DEFAULT 0,
-    CONSTRAINT advisory_metadata_id
-        FOREIGN KEY (advisory_id)
-            REFERENCES advisory_metadata (id),
-    CONSTRAINT rh_account_id
-        FOREIGN KEY (rh_account_id)
-            REFERENCES rh_account (id),
-    CONSTRAINT status_id
-        FOREIGN KEY (status_id)
-            REFERENCES status (id),
-    UNIQUE (advisory_id, rh_account_id),
-    PRIMARY KEY (rh_account_id, advisory_id)
-) WITH (fillfactor = '70', autovacuum_vacuum_scale_factor = '0.05')
-  TABLESPACE pg_default;
-
--- manager user needs to change this table for opt-out functionality
-GRANT SELECT, INSERT, UPDATE, DELETE ON advisory_account_data TO manager;
--- evaluator user needs to change this table
-GRANT SELECT, INSERT, UPDATE, DELETE ON advisory_account_data TO evaluator;
--- listner user needs to change this table when deleting system
-GRANT SELECT, INSERT, UPDATE, DELETE ON advisory_account_data TO listener;
--- vmaas_sync needs to update stale mark, which creates and deletes advisory_account_data
-GRANT SELECT, INSERT, UPDATE, DELETE ON advisory_account_data TO vmaas_sync;
-
--- the following constraints are enabled here not directly in the table definitions
--- to make new schema equal to the migrated schema
-ALTER TABLE system_advisories
-    ADD CONSTRAINT advisory_metadata_id
-        FOREIGN KEY (advisory_id)
-            REFERENCES advisory_metadata (id),
-    ADD CONSTRAINT status_id
-        FOREIGN KEY (status_id)
-            REFERENCES status (id);
-ALTER TABLE system_platform
-    ADD CONSTRAINT rh_account_id
-        FOREIGN KEY (rh_account_id)
-            REFERENCES rh_account (id);
-
--- repo
-CREATE TABLE IF NOT EXISTS repo
-(
-    id              INT GENERATED BY DEFAULT AS IDENTITY,
-    name            TEXT NOT NULL UNIQUE,
-    third_party     BOOLEAN NOT NULL DEFAULT true,
-    CHECK (NOT empty(name)),
-    PRIMARY KEY (id)
+CREATE TABLE IF NOT EXISTS module_stream_require (
+  module_stream_id INT NOT NULL,
+  require_id INT NOT NULL,
+  CONSTRAINT module_stream_id
+    FOREIGN KEY (module_stream_id)
+    REFERENCES module_stream (id),
+  CONSTRAINT require_id
+    FOREIGN KEY (require_id)
+    REFERENCES module_stream (id),
+  CONSTRAINT module_stream_dep_uq
+    UNIQUE (module_stream_id, require_id)
 ) TABLESPACE pg_default;
 
-GRANT SELECT, INSERT, UPDATE, DELETE ON repo TO listener;
-GRANT SELECT, INSERT, UPDATE, DELETE ON repo TO evaluator;
 
+-- -----------------------------------------------------
+-- Table vmaas.pkg_errata
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS pkg_errata (
+  pkg_id INT NOT NULL,
+  errata_id INT NOT NULL,
+  module_stream_id INT,
+  CONSTRAINT pkg_id
+    FOREIGN KEY (pkg_id)
+    REFERENCES package (id),
+  CONSTRAINT errata_id
+    FOREIGN KEY (errata_id)
+    REFERENCES errata (id),
+  CONSTRAINT module_stream_id
+    FOREIGN KEY (module_stream_id)
+    REFERENCES module_stream (id)
+)TABLESPACE pg_default;
+CREATE TRIGGER pkg_errata_changed AFTER INSERT OR UPDATE OR DELETE ON pkg_errata
+  FOR EACH STATEMENT
+  EXECUTE PROCEDURE errata_changed();
 
--- system_repo
-CREATE TABLE IF NOT EXISTS system_repo
-(
-    system_id     INT NOT NULL,
-    repo_id       INT NOT NULL,
-    rh_account_id INT NOT NULL,
-    UNIQUE (rh_account_id, system_id, repo_id),
-    CONSTRAINT system_platform_id
-        FOREIGN KEY (rh_account_id, system_id)
-            REFERENCES system_platform (rh_account_id, id),
-    CONSTRAINT repo_id
-        FOREIGN KEY (repo_id)
-            REFERENCES repo (id)
+CREATE UNIQUE INDEX pkg_errata_pkgid_errataid ON pkg_errata (pkg_id, errata_id)
+WHERE module_stream_id IS NULL;
+CREATE UNIQUE INDEX pkg_errata_pkgid_streamid_errataid ON pkg_errata (pkg_id, module_stream_id, errata_id)
+WHERE module_stream_id IS NOT NULL;
+
+CREATE INDEX ON pkg_errata(errata_id);
+CREATE INDEX ON pkg_errata(module_stream_id);
+CREATE INDEX ON pkg_errata(pkg_id);
+
+CREATE TABLE IF NOT EXISTS db_upgrade_log (
+  id SERIAL,
+  version INT NOT NULL,
+  status TEXT NOT NULL,
+  script TEXT,
+  returncode INT,
+  stdout TEXT,
+  stderr TEXT,
+  last_updated TIMESTAMP WITH TIME ZONE NOT NULL
 ) TABLESPACE pg_default;
 
-CREATE INDEX ON system_repo (repo_id);
-
-GRANT SELECT, INSERT, UPDATE, DELETE ON system_repo TO listener;
-GRANT DELETE ON system_repo TO manager;
-GRANT SELECT, INSERT, UPDATE, DELETE ON system_repo TO evaluator;
-GRANT SELECT, DELETE on system_repo to vmaas_sync;
-
-CREATE TABLE IF NOT EXISTS package_name
-(
-    id   INT GENERATED BY DEFAULT AS IDENTITY NOT NULL PRIMARY KEY,
-    name TEXT                                 NOT NULL CHECK (NOT empty(name)) UNIQUE
-);
-
-GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE package_name TO vmaas_sync;
-
-CREATE TABLE IF NOT EXISTS strings
-(
-    id    BYTEA NOT NULL PRIMARY KEY,
-    value TEXT  NOT NULL
-);
-
-GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE strings TO vmaas_sync;
-
-CREATE TABLE IF NOT EXISTS package
-(
-    id               INT GENERATED BY DEFAULT AS IDENTITY NOT NULL PRIMARY KEY,
-    name_id          INT                                  NOT NULL REFERENCES package_name,
-    evra             TEXT                                 NOT NULL CHECK (NOT empty(evra)),
-    description_hash BYTEA                                         REFERENCES strings (id),
-    summary_hash     BYTEA                                         REFERENCES strings (id),
-    advisory_id      INT REFERENCES advisory_metadata (id),
-    UNIQUE (name_id, evra)
-) WITH (fillfactor = '70', autovacuum_vacuum_scale_factor = '0.05')
-  TABLESPACE pg_default;
-
-CREATE UNIQUE INDEX IF NOT EXISTS package_evra_idx on package (evra, name_id);
-
-GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE package TO vmaas_sync;
-GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE package TO evaluator;
-
--- Optimistic cache of latest released version for each package
--- Used for retrieving package descriptions on screens where we only show package(note nevra) level data
-CREATE MATERIALIZED VIEW IF NOT EXISTS package_latest_cache
-AS
-SELECT DISTINCT ON (p.name_id) p.name_id, p.id as package_id, sum.value as summary
-FROM package p
-         INNER JOIN strings sum on p.summary_hash = sum.id
-         LEFT JOIN advisory_metadata am on p.advisory_id = am.id
-ORDER BY p.name_id, am.public_date DESC NULLS LAST, sum.value DESC NULLS LAST;
-
-GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE package_latest_cache TO vmaas_sync;
-
-CREATE UNIQUE INDEX IF NOT EXISTS package_latest_cache_pkey ON package_latest_cache (name_id);
-
-CREATE TABLE IF NOT EXISTS system_package
-(
-    rh_account_id INT                                  NOT NULL REFERENCES rh_account,
-    system_id     INT                                  NOT NULL,
-    package_id    INT                                  NOT NULL REFERENCES package,
-    -- Use null to represent up-to-date packages
-    update_data   JSONB DEFAULT NULL,
-    latest_evra   TEXT GENERATED ALWAYS AS ( ((update_data ->> -1)::jsonb ->> 'evra')::text) STORED,
-    name_id       INTEGER REFERENCES package_name (id) NOT NULL,
-
-    PRIMARY KEY (rh_account_id, system_id, package_id) INCLUDE (latest_evra)
-) PARTITION BY HASH (rh_account_id);
-
-CREATE INDEX IF NOT EXISTS system_package_name_pkg_system_idx
-    ON system_package (rh_account_id, name_id, package_id, system_id) INCLUDE (latest_evra);
-
-GRANT SELECT, INSERT, UPDATE, DELETE ON system_package TO evaluator;
-GRANT SELECT, UPDATE, DELETE ON system_package TO listener;
-GRANT SELECT, UPDATE, DELETE ON system_package TO manager;
-GRANT SELECT, UPDATE, DELETE ON system_package TO vmaas_sync;
-
-SELECT create_table_partitions('system_package', 128,
-                               $$WITH (fillfactor = '70', autovacuum_vacuum_scale_factor = '0.05')$$);
-
--- timestamp_kv
-CREATE TABLE IF NOT EXISTS timestamp_kv
-(
-    name  TEXT                     NOT NULL UNIQUE,
-    CHECK (NOT empty(name)),
-    value TIMESTAMP WITH TIME ZONE NOT NULL
-) TABLESPACE pg_default;
-
-GRANT SELECT, INSERT, UPDATE, DELETE ON timestamp_kv TO vmaas_sync;
-
--- vmaas_sync needs to delete from this tables to sync CVEs correctly
-GRANT DELETE ON system_advisories TO vmaas_sync;
-GRANT DELETE ON advisory_account_data TO vmaas_sync;
-
--- ----------------------------------------------------------------------------
--- Read access for all users
--- ----------------------------------------------------------------------------
-
--- user for evaluator component
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO evaluator;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO evaluator;
-
--- user for listener component
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO listener;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO listener;
-
--- user for UI manager component
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO manager;
-
--- user for VMaaS sync component
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO vmaas_sync;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO vmaas_sync;
-GRANT SELECT, UPDATE ON repo TO vmaas_sync;
+CREATE TRIGGER db_upgrade_log_set_last_updated
+  BEFORE INSERT OR UPDATE ON db_upgrade_log
+  FOR EACH ROW EXECUTE PROCEDURE set_last_updated();
 
 
-CREATE SCHEMA IF NOT EXISTS inventory;
+-- -----------------------------------------------------
+-- Table vmaas.oval_operation_evr
+-- from https://oval-community-guidelines.readthedocs.io/en/latest/oval-schema-documentation/oval-common-schema.html
+-- Subset of values used in RH OVALs
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS oval_operation_evr (
+  id INT NOT NULL,
+  name TEXT UNIQUE NOT NULL, CHECK (NOT empty(name)),
+  PRIMARY KEY (id)
+)TABLESPACE pg_default;
 
--- The admin ROLE that allows the inventory schema to be managed
-DO $$
-BEGIN
-  CREATE ROLE cyndi_admin;
-  EXCEPTION WHEN DUPLICATE_OBJECT THEN
-    RAISE NOTICE 'cyndi_admin already exists';
-END
-$$;
-GRANT ALL PRIVILEGES ON SCHEMA inventory TO cyndi_admin;
+INSERT INTO oval_operation_evr (id, name) VALUES
+  (1, 'equals'), (2, 'less than');
 
--- The reader ROLE that provides SELECT access to the inventory.hosts view
-DO $$
-BEGIN
-  CREATE ROLE cyndi_reader;
-  EXCEPTION WHEN DUPLICATE_OBJECT THEN
-    RAISE NOTICE 'cyndi_reader already exists';
-END
-$$;
-GRANT USAGE ON SCHEMA inventory TO cyndi_reader;
 
--- The application user is granted the reader role only to eliminate any interference with Cyndi
-GRANT cyndi_reader to listener;
-GRANT cyndi_reader to evaluator;
-GRANT cyndi_reader to manager;
-GRANT cyndi_reader TO vmaas_sync;
+-- -----------------------------------------------------
+-- Table vmaas.oval_check_rpminfo
+-- from https://oval-community-guidelines.readthedocs.io/en/latest/oval-schema-documentation/oval-common-schema.html
+-- Subset of values used in RH OVALs
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS oval_check_rpminfo (
+  id INT NOT NULL,
+  name TEXT UNIQUE NOT NULL, CHECK (NOT empty(name)),
+  PRIMARY KEY (id)
+)TABLESPACE pg_default;
 
-GRANT cyndi_admin to cyndi;
+INSERT INTO oval_check_rpminfo (id, name) VALUES
+  (1, 'at least one');
+
+
+-- -----------------------------------------------------
+-- Table vmaas.oval_check_existence_rpminfo
+-- from https://oval-community-guidelines.readthedocs.io/en/latest/oval-schema-documentation/oval-common-schema.html
+-- Subset of values used in RH OVALs
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS oval_check_existence_rpminfo (
+  id INT NOT NULL,
+  name TEXT UNIQUE NOT NULL, CHECK (NOT empty(name)),
+  PRIMARY KEY (id)
+)TABLESPACE pg_default;
+
+INSERT INTO oval_check_existence_rpminfo (id, name) VALUES
+  (1, 'at_least_one_exists'), (2, 'none_exist');
+
+
+-- -----------------------------------------------------
+-- Table vmaas.oval_definition_type
+-- from https://oval-community-guidelines.readthedocs.io/en/latest/oval-schema-documentation/oval-common-schema.html
+-- Subset of values used in RH OVALs
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS oval_definition_type (
+  id INT NOT NULL,
+  name TEXT UNIQUE NOT NULL, CHECK (NOT empty(name)),
+  PRIMARY KEY (id)
+)TABLESPACE pg_default;
+
+INSERT INTO oval_definition_type (id, name) VALUES
+  (1, 'patch'), (2, 'vulnerability');
+
+
+-- -----------------------------------------------------
+-- Table vmaas.oval_criteria_operator
+-- from https://oval-community-guidelines.readthedocs.io/en/latest/oval-schema-documentation/oval-common-schema.html
+-- Subset of values used in RH OVALs
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS oval_criteria_operator (
+  id INT NOT NULL,
+  name TEXT UNIQUE NOT NULL, CHECK (NOT empty(name)),
+  PRIMARY KEY (id)
+)TABLESPACE pg_default;
+
+INSERT INTO oval_criteria_operator (id, name) VALUES
+  (1, 'AND'), (2, 'OR');
+
+
+-- -----------------------------------------------------
+-- Table vmaas.oval_file
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS oval_file (
+  id SERIAL,
+  oval_id TEXT UNIQUE NOT NULL, CHECK (NOT empty(oval_id)),
+  updated TIMESTAMP WITH TIME ZONE NOT NULL,
+  PRIMARY KEY (id)
+)TABLESPACE pg_default;
+
+
+-- -----------------------------------------------------
+-- Table vmaas.oval_rpminfo_object
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS oval_rpminfo_object (
+  id SERIAL,
+  file_id INT NOT NULL,
+  oval_id TEXT NOT NULL, CHECK (NOT empty(oval_id)),
+  package_name_id INT NOT NULL,
+  version INT NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE (file_id, oval_id),
+  CONSTRAINT file_id
+    FOREIGN KEY (file_id)
+    REFERENCES oval_file (id),
+  CONSTRAINT package_name_id
+    FOREIGN KEY (package_name_id)
+    REFERENCES package_name (id)
+)TABLESPACE pg_default;
+
+
+-- -----------------------------------------------------
+-- Table vmaas.oval_rpminfo_state
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS oval_rpminfo_state (
+  id SERIAL,
+  file_id INT NOT NULL,
+  oval_id TEXT NOT NULL, CHECK (NOT empty(oval_id)),
+  evr_id INT,
+  evr_operation_id INT,
+  version INT NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE (file_id, oval_id),
+  CONSTRAINT file_id
+    FOREIGN KEY (file_id)
+    REFERENCES oval_file (id),
+  CONSTRAINT evr_id
+    FOREIGN KEY (evr_id)
+    REFERENCES evr (id),
+  CONSTRAINT evr_operation_id
+    FOREIGN KEY (evr_operation_id)
+    REFERENCES oval_operation_evr (id)
+)TABLESPACE pg_default;
+
+
+-- -----------------------------------------------------
+-- Table vmaas.oval_rpminfo_state_arch
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS oval_rpminfo_state_arch (
+  rpminfo_state_id INT NOT NULL,
+  arch_id INT NOT NULL,
+  UNIQUE (rpminfo_state_id, arch_id),
+  CONSTRAINT rpminfo_state_id
+    FOREIGN KEY (rpminfo_state_id)
+    REFERENCES oval_rpminfo_state (id)
+    ON DELETE CASCADE,
+  CONSTRAINT arch_id
+    FOREIGN KEY (arch_id)
+    REFERENCES arch (id)
+)TABLESPACE pg_default;
+
+
+-- -----------------------------------------------------
+-- Table vmaas.oval_rpminfo_test
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS oval_rpminfo_test (
+  id SERIAL,
+  file_id INT NOT NULL,
+  oval_id TEXT NOT NULL, CHECK (NOT empty(oval_id)),
+  rpminfo_object_id INT NOT NULL,
+  check_id INT NOT NULL,
+  check_existence_id INT NOT NULL,
+  version INT NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE (file_id, oval_id),
+  CONSTRAINT file_id
+    FOREIGN KEY (file_id)
+    REFERENCES oval_file (id),
+  CONSTRAINT rpminfo_object_id
+    FOREIGN KEY (rpminfo_object_id)
+    REFERENCES oval_rpminfo_object (id)
+    ON DELETE CASCADE,
+  CONSTRAINT check_id
+    FOREIGN KEY (check_id)
+    REFERENCES oval_check_rpminfo (id),
+  CONSTRAINT check_existence_id
+    FOREIGN KEY (check_existence_id)
+    REFERENCES oval_check_existence_rpminfo (id)
+)TABLESPACE pg_default;
+
+CREATE INDEX ON oval_rpminfo_test(rpminfo_object_id); -- deletion performance
+
+-- -----------------------------------------------------
+-- Table vmaas.oval_rpminfo_test_state
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS oval_rpminfo_test_state (
+  rpminfo_test_id INT NOT NULL,
+  rpminfo_state_id INT NOT NULL,
+  UNIQUE (rpminfo_test_id, rpminfo_state_id),
+  CONSTRAINT rpminfo_test_id
+    FOREIGN KEY (rpminfo_test_id)
+    REFERENCES oval_rpminfo_test (id)
+    ON DELETE CASCADE,
+  CONSTRAINT rpminfo_state_id
+    FOREIGN KEY (rpminfo_state_id)
+    REFERENCES oval_rpminfo_state (id)
+    ON DELETE CASCADE
+)TABLESPACE pg_default;
+
+CREATE INDEX ON oval_rpminfo_test_state(rpminfo_state_id); -- deletion performance
+
+
+-- -----------------------------------------------------
+-- Table vmaas.oval_module_test
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS oval_module_test (
+  id SERIAL,
+  file_id INT NOT NULL,
+  oval_id TEXT NOT NULL, CHECK (NOT empty(oval_id)),
+  module_stream TEXT NOT NULL, CHECK (NOT empty(module_stream)),
+  version INT NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE (file_id, oval_id),
+  CONSTRAINT file_id
+    FOREIGN KEY (file_id)
+    REFERENCES oval_file (id)
+)TABLESPACE pg_default;
+
+
+-- -----------------------------------------------------
+-- Table vmaas.oval_criteria
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS oval_criteria (
+  id SERIAL,
+  operator_id INT NOT NULL,
+  CONSTRAINT operator_id
+    FOREIGN KEY (operator_id)
+    REFERENCES oval_criteria_operator (id),
+  PRIMARY KEY (id)
+)TABLESPACE pg_default;
+
+
+-- -----------------------------------------------------
+-- Table vmaas.oval_criteria_dependency
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS oval_criteria_dependency (
+  parent_criteria_id INT NOT NULL,
+  dep_criteria_id INT,
+  dep_test_id INT,
+  dep_module_test_id INT,
+  CONSTRAINT dep_criteria_id_dep_test_id CHECK((dep_criteria_id IS NOT NULL AND dep_test_id IS NULL AND dep_module_test_id IS NULL) OR
+                                               (dep_criteria_id IS NULL AND dep_test_id IS NOT NULL AND dep_module_test_id IS NULL) OR
+                                               (dep_criteria_id IS NULL AND dep_test_id IS NULL AND dep_module_test_id IS NOT NULL)),
+  CONSTRAINT parent_criteria_id
+    FOREIGN KEY (parent_criteria_id)
+    REFERENCES oval_criteria (id),
+  CONSTRAINT dep_criteria_id
+    FOREIGN KEY (dep_criteria_id)
+    REFERENCES oval_criteria (id),
+  CONSTRAINT dep_test_id
+    FOREIGN KEY (dep_test_id)
+    REFERENCES oval_rpminfo_test (id)
+    ON DELETE CASCADE,
+  CONSTRAINT dep_module_test_id
+    FOREIGN KEY (dep_module_test_id)
+    REFERENCES oval_module_test (id)
+    ON DELETE CASCADE
+)TABLESPACE pg_default;
+
+CREATE UNIQUE INDEX ocd_dep_criteria_id_dep_test_id_1 ON oval_criteria_dependency (parent_criteria_id, dep_criteria_id)
+    WHERE dep_criteria_id IS NOT NULL AND dep_test_id IS NULL AND dep_module_test_id IS NULL;
+CREATE UNIQUE INDEX ocd_dep_criteria_id_dep_test_id_2 ON oval_criteria_dependency (parent_criteria_id, dep_test_id)
+    WHERE dep_criteria_id IS NULL AND dep_test_id IS NOT NULL AND dep_module_test_id IS NULL;
+CREATE UNIQUE INDEX ocd_dep_criteria_id_dep_test_id_3 ON oval_criteria_dependency (parent_criteria_id, dep_module_test_id)
+    WHERE dep_criteria_id IS NULL AND dep_test_id IS NULL AND dep_module_test_id IS NOT NULL;
+
+CREATE INDEX ON oval_criteria_dependency(parent_criteria_id);
+CREATE INDEX ON oval_criteria_dependency(dep_test_id); -- deletion performance
+CREATE INDEX ON oval_criteria_dependency(dep_module_test_id); -- deletion performance
+
+
+-- -----------------------------------------------------
+-- Table vmaas.oval_definition
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS oval_definition (
+  id SERIAL,
+  file_id INT NOT NULL,
+  oval_id TEXT NOT NULL, CHECK (NOT empty(oval_id)),
+  definition_type_id INT NOT NULL,
+  criteria_id INT,
+  version INT NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE (file_id, oval_id),
+  CONSTRAINT file_id
+    FOREIGN KEY (file_id)
+    REFERENCES oval_file (id),
+  CONSTRAINT definition_type_id
+    FOREIGN KEY (definition_type_id)
+    REFERENCES oval_definition_type (id),
+  CONSTRAINT criteria_id
+    FOREIGN KEY (criteria_id)
+    REFERENCES oval_criteria (id)
+)TABLESPACE pg_default;
+
+
+-- -----------------------------------------------------
+-- Table vmaas.oval_definition_test
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS oval_definition_test (
+  definition_id INT NOT NULL,
+  rpminfo_test_id INT NOT NULL,
+  UNIQUE (definition_id, rpminfo_test_id),
+  CONSTRAINT definition_id
+    FOREIGN KEY (definition_id)
+    REFERENCES oval_definition (id)
+    ON DELETE CASCADE,
+  CONSTRAINT rpminfo_test_id
+    FOREIGN KEY (rpminfo_test_id)
+    REFERENCES oval_rpminfo_test (id)
+    ON DELETE CASCADE
+)TABLESPACE pg_default;
+
+CREATE INDEX ON oval_definition_test(rpminfo_test_id); -- deletion performance
+
+-- -----------------------------------------------------
+-- Table vmaas.oval_definition_cve
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS oval_definition_cve (
+  definition_id INT NOT NULL,
+  cve_id INT NOT NULL,
+  UNIQUE (definition_id, cve_id),
+  CONSTRAINT definition_id
+    FOREIGN KEY (definition_id)
+    REFERENCES oval_definition (id)
+    ON DELETE CASCADE,
+  CONSTRAINT cve_id
+    FOREIGN KEY (cve_id)
+    REFERENCES cve (id)
+)TABLESPACE pg_default;
+
+
+-- -----------------------------------------------------
+-- Table vmaas.oval_definition_errata
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS oval_definition_errata (
+  definition_id INT NOT NULL,
+  errata_id INT NOT NULL,
+  UNIQUE (definition_id, errata_id),
+  CONSTRAINT definition_id
+    FOREIGN KEY (definition_id)
+    REFERENCES oval_definition (id)
+    ON DELETE CASCADE,
+  CONSTRAINT errata_id
+    FOREIGN KEY (errata_id)
+    REFERENCES errata (id)
+)TABLESPACE pg_default;
+
+CREATE INDEX ON oval_definition_errata(errata_id);
+
+
+-- -----------------------------------------------------
+-- Table vmaas.oval_definition_cpe
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS oval_definition_cpe (
+  definition_id INT NOT NULL,
+  cpe_id INT NOT NULL,
+  UNIQUE (definition_id, cpe_id),
+  CONSTRAINT definition_id
+    FOREIGN KEY (definition_id)
+    REFERENCES oval_definition (id)
+    ON DELETE CASCADE,
+  CONSTRAINT cpe_id
+    FOREIGN KEY (cpe_id)
+    REFERENCES cpe (id)
+)TABLESPACE pg_default;
+
+
+-- -----------------------------------------------------
+-- vmaas users permission setup:
+-- vmaas_writer - has rights to INSERT/UPDATE/DELETE; used by reposcan
+-- vmaas_reader - has SELECT only; used by webapp
+-- -----------------------------------------------------
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO vmaas_writer;
+GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO vmaas_writer;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO vmaas_reader;

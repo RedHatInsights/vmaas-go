@@ -13,10 +13,10 @@ if [ ! -z "$DB_HOST" ]; then
     CHECK_QUERY="\q" # Wait only for empty database.
   elif [ ! -z "$WAIT_FOR_FULL_DB" ]; then
     # Wait for full schema, all migrations, e.g. before tests (schema_migrations.dirty='f').
-    CHECK_QUERY="SELECT 1/count(*) FROM schema_migrations WHERE dirty='f';"
+    CHECK_QUERY="SELECT 1/count(*) FROM db_version;"
   else
     # Wait for created schema.
-    CHECK_QUERY="SELECT * FROM schema_migrations;"
+    CHECK_QUERY="SELECT * FROM db_version;"
   fi
   until PGPASSWORD="$DB_PASSWD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -c "${CHECK_QUERY}" -q 2>/dev/null; do
     >&2 echo "PostgreSQL is unavailable - sleeping (host: $DB_HOST, port: $DB_PORT, user: $DB_USER, db_name: $DB_NAME)"
