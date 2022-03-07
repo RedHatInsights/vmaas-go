@@ -3,6 +3,7 @@ package manager
 import (
 	"app/base"
 	"app/base/core"
+	"app/base/redisdb"
 	"app/base/utils"
 	"app/docs"
 	"app/manager/middlewares"
@@ -28,7 +29,8 @@ import (
 // @in header
 // @name x-rh-identity
 func RunManager() {
-	core.ConfigureApp()
+	utils.ConfigureLogging()
+	redisdb.Configure()
 
 	utils.Log().Info("Manager starting")
 	// create web app
