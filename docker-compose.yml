@@ -8,7 +8,7 @@ services:
       args:
         - INSTALL_TOOLS=yes
       target: buildimg
-    image: patchman-engine_patchimg
+    image: app_image
 
   db:
     container_name: db
@@ -22,12 +22,15 @@ services:
       - 5433:5432
     env_file:
       - ./conf/database.env
+    security_opt:
+      - label=disable
 
   db_admin:
     container_name: db_admin
-    image: patchman-engine_patchimg
+    image: app_image
     env_file:
       - ./conf/common.env
+      - ./conf/database_common.env
       - ./conf/database_admin.env
       - ./conf/gorun.env
     command: ./database_admin/entrypoint.sh
@@ -41,7 +44,7 @@ services:
 
   db_feed:
     container_name: db_feed
-    image: patchman-engine_patchimg
+    image: app_image
     env_file:
       - ./conf/test.env
       - ./conf/gorun.env
@@ -54,25 +57,32 @@ services:
     security_opt:
       - label=disable
 
+  redis:
+    container_name: redis
+    image: redis:6.2-alpine
+    restart: unless-stopped
+    command: /bin/sh -c "redis-server --requirepass $$REDIS_PASSWORD"
+    environment:
+      REDIS_PASSWORD: redis_pwd
+    ports:
+      - 6379:6379
+
   platform:
     container_name: platform
-    image: patchman-engine_patchimg
-    env_file:
-      - ./conf/platform.env
+    image: app_image
     command: ./scripts/entrypoint.sh platform
     restart: unless-stopped
     depends_on:
-      - db
-      - kafka
       - patchimg
     ports:
       - 9001:9001
 
   manager:
     container_name: manager
-    image: patchman-engine_patchimg
+    image: app_image
     env_file:
       - ./conf/common.env
+      - ./conf/database_common.env
       - ./conf/manager.env
       - ./conf/gorun.env
     command: ./scripts/entrypoint.sh manager
@@ -83,6 +93,28 @@ services:
       - db
       - platform
       - patchimg
+    volumes:
+      - ./:/go/src/app
+    security_opt:
+      - label=disable
+
+  exporter:
+    container_name: exporter
+    image: app_image
+    env_file:
+      - ./conf/common.env
+      - ./conf/database_common.env
+      - ./conf/exporter.env
+      - ./conf/gorun.env
+    command: ./scripts/entrypoint.sh exporter
+    ports:
+      - 8083:8083
+    restart: unless-stopped
+    depends_on:
+      - db
+      - platform
+      - patchimg
+      - redis
     volumes:
       - ./:/go/src/app
     security_opt:
