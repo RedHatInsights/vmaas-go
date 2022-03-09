@@ -3,6 +3,7 @@ package main
 import (
 	"app/base"
 	"app/base/utils"
+	"app/exporter"
 	"app/manager"
 	"app/platform"
 	"log"
@@ -20,6 +21,9 @@ func main() {
 			return
 		case "platform":
 			platform.RunPlatformMock()
+			return
+		case "exporter":
+			exporter.RunVmaasSync()
 			return
 		case "print_clowder_params":
 			utils.PrintClowderParams()

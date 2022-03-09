@@ -29,7 +29,7 @@ services:
       args:
         - INSTALL_TOOLS=yes
       target: buildimg
-    image: patchman-engine_patchimg
+    image: app_image
     command: ./scripts/entrypoint.sh platform
     restart: unless-stopped
     ports:
@@ -37,7 +37,7 @@ services:
 
   test:
     container_name: test
-    image: patchman-engine_patchimg
+    image: app_image
     env_file:
       - ./conf/test.env
       - ./conf/database.env
