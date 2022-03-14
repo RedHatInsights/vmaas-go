@@ -2,7 +2,7 @@
 
 set -exv
 
-IMAGE="quay.io/cloudservices/patchman-engine-app"
+IMAGE="quay.io/cloudservices/vmaas-go-app"
 IMAGE_TAG=$(git rev-parse --short=7 HEAD)
 
 if [[ -z "$QUAY_USER" || -z "$QUAY_TOKEN" ]]; then
