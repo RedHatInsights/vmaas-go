@@ -13,21 +13,13 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// nolint: lll
-// @title Patchman-engine API
+// @title vmaas-go API
 // DO NOT EDIT version MANUALLY - this variable is modified by generate_docs.sh
 // @version  v0.0.1
-// @description API of the Patch application on [console.redhat.com](https://console.redhat.com)
-// @description
-// @description Syntax of the `filter[name]` query parameters is described in  [Filters documentation](https://github.com/RedHatInsights/patchman-engine/wiki/API-custom-filters)
+// @description API of the vmaas-go application on [console.redhat.com](https://console.redhat.com)
 
 // @license.name GPLv3
 // @license.url https://www.gnu.org/licenses/gpl-3.0.en.html
-
-// @query.collection.format multi
-// @securityDefinitions.apikey RhIdentity
-// @in header
-// @name x-rh-identity
 func RunManager() {
 	utils.ConfigureLogging()
 	redisdb.Configure()
