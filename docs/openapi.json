@@ -1,8 +1,8 @@
 {
     "openapi": "3.0.1",
     "info": {
-        "title": "Patchman-engine API",
-        "description": "API of the Patch application on [console.redhat.com](https://console.redhat.com)\n\nSyntax of the `filter[name]` query parameters is described in  [Filters documentation](https://github.com/RedHatInsights/patchman-engine/wiki/API-custom-filters)",
+        "title": "vmaas-go API",
+        "description": "API of the vmaas-go application on [console.redhat.com](https://console.redhat.com)",
         "contact": {},
         "license": {
             "name": "GPLv3",
@@ -59,13 +59,6 @@
                         }
                     }
                 }
-            }
-        },
-        "securitySchemes": {
-            "RhIdentity": {
-                "type": "apiKey",
-                "name": "x-rh-identity",
-                "in": "header"
             }
         }
     }
