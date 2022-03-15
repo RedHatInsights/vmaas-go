@@ -14,7 +14,7 @@ type packageRepoRow struct {
 
 func syncRepos() error {
 	rows, err := database.Db.Table("pkg_repo pr").
-		Select("pr.pkg_id AS package_id, 'r:' || c.name AS repo").
+		Select("pr.pkg_id AS package_id, 'r:' || c.label AS repo").
 		Joins("JOIN repo r ON pr.repo_id = r.id").
 		Joins("JOIN content_set c ON c.id = r.content_set_id").
 		Rows()

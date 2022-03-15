@@ -21,12 +21,12 @@ func TestSyncRepos(t *testing.T) {
 }
 
 func checkReposDataInRedis(t *testing.T) {
-	ID1s, err := redisdb.Rdb.SMembers(base.Context, "r:content-set-name-1").Result()
+	ID1s, err := redisdb.Rdb.SMembers(base.Context, "r:content set 1").Result()
 	assert.Nil(t, err)
 	sort.Strings(ID1s)
 	assert.Equal(t, []string{"301", "302", "303", "304", "305", "306"}, ID1s)
 
-	ID2s, err := redisdb.Rdb.SMembers(base.Context, "r:content-set-name-2").Result()
+	ID2s, err := redisdb.Rdb.SMembers(base.Context, "r:content set 2").Result()
 	assert.Nil(t, err)
 	sort.Strings(ID2s)
 	assert.Equal(t, []string{"306", "307"}, ID2s)
