@@ -16,7 +16,6 @@ require (
 	github.com/json-iterator/go v1.1.11 // indirect
 	github.com/kr/pretty v0.2.1 // indirect
 	github.com/lestrrat-go/backoff v1.0.0
-	github.com/lib/pq v1.9.0 // indirect
 	github.com/mattn/go-isatty v0.0.13 // indirect
 	github.com/pkg/errors v0.9.1
 	github.com/prometheus/client_golang v1.7.0
@@ -31,8 +30,8 @@ require (
 	golang.org/x/net v0.0.0-20211104170005-ce137452f963 // indirect
 	google.golang.org/protobuf v1.27.1 // indirect
 	gopkg.in/yaml.v3 v3.0.0-20210107192922-496545a6307b // indirect
-	gorm.io/driver/postgres v1.0.5
-	gorm.io/gorm v1.20.12
+	gorm.io/driver/postgres v1.3.1
+	gorm.io/gorm v1.23.1
 )
 
 replace github.com/ezamriy/gorpm v0.0.0-20160905202458-25f7273cbf51 => github.com/MichaelMraka/gorpm v0.0.0-20210923131407-e21b5950f175
