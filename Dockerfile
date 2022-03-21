@@ -74,7 +74,6 @@ RUN curl -L -o /usr/bin/haberdasher \
 ADD --chown=insights:root go.sum                     /go/src/app/
 ADD --chown=insights:root scripts                    /go/src/app/scripts
 ADD --chown=insights:root database_admin/*.sh        /go/src/app/database_admin/
-ADD --chown=insights:root database_admin/*.sql       /go/src/app/database_admin/
 ADD --chown=insights:root database_admin/schema      /go/src/app/database_admin/schema
 ADD --chown=insights:root docs/openapi.json          /go/src/app/docs/
 
