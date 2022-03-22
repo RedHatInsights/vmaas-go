@@ -15,7 +15,7 @@ import (
 
 // @title vmaas-go API
 // DO NOT EDIT version MANUALLY - this variable is modified by generate_docs.sh
-// @version  v0.0.3
+// @version  v0.0.4
 // @description API of the vmaas-go application on [console.redhat.com](https://console.redhat.com)
 
 // @license.name GPLv3
