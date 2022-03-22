@@ -4,6 +4,7 @@ import (
 	"app/base"
 	"app/base/utils"
 	"fmt"
+	"os"
 	"strconv"
 
 	"github.com/go-redis/redis/v8"
@@ -22,7 +23,8 @@ func Configure() {
 	utils.Log("host", host, "port", port).Info("Connecting to Redis")
 	Rdb = redis.NewClient(&redis.Options{
 		Addr:     fmt.Sprintf("%s:%d", host, port),
-		Password: utils.Getenv("REDIS_PASSWORD", "FILL"),
+		Username: os.Getenv("REDIS_USER"),
+		Password: os.Getenv("REDIS_PASSWORD"),
 	})
 
 	check()

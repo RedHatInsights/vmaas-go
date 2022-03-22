@@ -1,0 +1,73 @@
+---
+apiVersion: v1
+kind: Template
+metadata:
+  name: vmaas-go
+objects:
+- apiVersion: cloud.redhat.com/v1alpha1
+  kind: ClowdApp
+  metadata:
+    name: vmaas-go
+  spec:
+    envName: ${ENV_NAME}
+    deployments:
+    - name: manager
+      minReplicas: ${{REPLICAS_MANAGER}}
+      webServices:
+        public:
+          enabled: true
+        private:
+          enabled: false
+        metrics:
+          enabled: true
+      podSpec:
+        image: ${IMAGE}:${IMAGE_TAG_MANAGER}
+        command:
+          - ./scripts/entrypoint.sh
+          - manager
+        env:
+        - {name: LOG_LEVEL, value: '${LOG_LEVEL_MANAGER}'}
+        - {name: CMD_WRAPPER, value: '${CMD_WRAPPER}'}
+        - {name: GODEBUG, value: '${GODEBUG_MANAGER}'}
+        - {name: GOMAXPROCS, value: '${GOMAXPROCS_MANAGER}'}
+        - {name: GIN_MODE, value: '${GIN_MODE}'}
+        - {name: CLOWDER_ENABLED, value: '${CLOWDER_ENABLED}'}
+        - {name: SHOW_CLOWDER_VARS, value: ''}
+
+        resources:
+          limits: {cpu: '${RES_CPU_MANAGER}', memory: '${RES_MEM_MANAGER}'}
+          requests: {cpu: '${RES_CPU_MANAGER}', memory: '${RES_MEM_MANAGER}'}
+
+    dependencies: []
+#    - vmaas # TODO add and connect exporter to it
+    inMemoryDb: true
+    cyndi:
+      enabled: false
+    testing:
+      iqePlugin: ''
+
+- apiVersion: v1
+  kind: Secret
+  metadata:
+    name: vmaas-go-passwords
+    namespace: test  # namespace is overwritten by bonfire
+  type: Opaque
+  data:
+    manager-redis-password: bWFuYWdlcg== # manager
+
+parameters:
+# Manager
+- {name: REPLICAS_MANAGER, value: '1'}
+- {name: IMAGE_TAG_MANAGER, value: latest}
+- {name: LOG_LEVEL_MANAGER, value: debug}
+- {name: GODEBUG_MANAGER, value: 'x509ignoreCN=0'}
+- {name: GOMAXPROCS_MANAGER, value: '8'}
+- {name: RES_CPU_MANAGER, value: 200m}
+- {name: RES_MEM_MANAGER, value: 256Mi}
+
+# Common parameters
+- {name: IMAGE, value: quay.io/cloudservices/vmaas-go}
+- {name: ENV_NAME, required: false}
+- {name: CMD_WRAPPER, value: ''} # Optional wrapper to run base command with (e.g. "haberdasher").
+- {name: GIN_MODE, value: 'release'} # Gin webframework running mode
+- {name: CLOWDER_ENABLED, value: 'true'} # Enable params reading from Clowder json config (ACG_CONFIG)
