@@ -2,9 +2,10 @@ package utils
 
 import (
 	"fmt"
-	clowder "github.com/redhatinsights/app-common-go/pkg/api/v1"
 	"os"
 	"strings"
+
+	clowder "github.com/redhatinsights/app-common-go/pkg/api/v1"
 )
 
 // IsClowderEnabled Check env variable CLOWDER_ENABLED = "true".
@@ -20,6 +21,8 @@ func PrintClowderParams() {
 		fmt.Println("Clowder config enabled, exporting variables..")
 		// Database
 		printDBParams()
+		// Redis
+		printRedisParams()
 		// API
 		fmt.Printf("PUBLIC_PORT=%d\n", *clowder.LoadedConfig.PublicPort)
 		fmt.Printf("PRIVATE_PORT=%d\n", *clowder.LoadedConfig.PrivatePort)
@@ -51,6 +54,17 @@ func printDBParams() {
 		}
 		fmt.Printf("DB_SSLROOTCERT=%s\n", certPath)
 	}
+}
+
+func printRedisParams() {
+	fmt.Printf("REDIS_HOST=%s\n", clowder.LoadedConfig.InMemoryDb.Hostname)
+	if clowder.LoadedConfig.InMemoryDb.Username != nil {
+		fmt.Printf("REDIS_USER=%s\n", *clowder.LoadedConfig.InMemoryDb.Username)
+	}
+	if clowder.LoadedConfig.InMemoryDb.Password != nil {
+		fmt.Printf("REDIS_PASSWORD=%s\n", *clowder.LoadedConfig.InMemoryDb.Password)
+	}
+	fmt.Printf("REDIS_PORT=%d\n", clowder.LoadedConfig.InMemoryDb.Port)
 }
 
 func printKafkaParams() {

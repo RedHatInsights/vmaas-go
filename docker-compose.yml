@@ -82,7 +82,6 @@ services:
     image: app_image
     env_file:
       - ./conf/common.env
-      - ./conf/database_common.env
       - ./conf/manager.env
       - ./conf/gorun.env
     command: ./scripts/entrypoint.sh manager
